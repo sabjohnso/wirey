@@ -5,6 +5,11 @@
                     wirey/protocol
                     wirey/codec
                     wirey/syntax
+                    wirey/length-expr
+                    wirey/stack
+                    wirey/dispatch
+                    wirey/checksum
+                    wirey/enum
                     racket/base
                     racket/match]]
 
@@ -13,22 +18,34 @@
 
 @defmodule[wirey]
 
-Wirey is a Racket library for declaratively specifying binary wire protocols.
-It provides both a data-driven description layer and a macro surface syntax
-for defining wire structures, with automatic generation of
-encoders, decoders, field accessors, and match expanders.
+Wirey is a Racket-native DSL for declaratively specifying binary wire
+protocols. Inspired by ACN (ASN.1 Control Notation), it provides both a
+data-driven description layer and a macro surface syntax for defining wire
+structures with automatic generation of encoders, decoders, field accessors,
+and match expanders.
 
-Wirey currently supports byte-aligned, fixed-width fields with configurable
-byte order. Field types include unsigned integers, signed integers
-(two's complement), fixed-width ASCII strings, and raw byte sequences.
+@bold{Key capabilities:}
+
+@itemlist[
+  @item{@bold{struct/wire} — define binary layouts with keyword encode,
+    zero-copy decode, and pattern matching}
+  @item{@bold{Bitfields} — sub-byte fields with MSB/LSB bit ordering}
+  @item{@bold{Variable-length fields} — widths dependent on other fields}
+  @item{@bold{Protocol composition} — layered decode with dispatch
+    (Ethernet → IPv4 → TCP)}
+  @item{@bold{Message dispatch} — route bytes to the correct wire struct
+    by discriminator field}
+  @item{@bold{Computed fields} — auto-computed checksums via two-pass encoding}
+  @item{@bold{Rich type system} — uint, sint, float32/64, bcd, bool,
+    alpha, utf8, utf16, utf32, octets, padding}
+  @item{@bold{Contracts, enums, defaults, arrays, conditional fields,
+    alignment, embedded structs}}
+]
 
 @table-of-contents[]
 
 @; ------------------------------------------------------------------
 @section{Quick Start}
-
-Define a wire structure with @racket[struct/wire], then use the generated
-encode, decode, and accessor functions:
 
 @racketblock[
 (require wirey racket/match)
@@ -50,8 +67,8 @@ encode, decode, and accessor functions:
 
 (code:comment "Decode to a wire struct, access fields by name")
 (define hdr (udp-header-decode pkt))
-(udp-header-src-port hdr) (code:comment "49152")
-(udp-header-dst-port hdr) (code:comment "53")
+(udp-header-src-port hdr)
+(udp-header-dst-port hdr)
 
 (code:comment "Pattern match on specific fields")
 (match hdr
@@ -66,274 +83,468 @@ encode, decode, and accessor functions:
 
 @defform[(struct/wire name
            maybe-byte-order
+           maybe-bit-order
+           maybe-alignment
            field-spec ...)
          #:grammar
          ([maybe-byte-order (code:line)
                             (code:line #:byte-order byte-order-id)]
-          [field-spec (field-name type-id width-nat)
-                      (field-name type-id width-nat #:byte-order byte-order-id)])]{
-Defines a binary wire structure and introduces the following bindings:
+          [maybe-bit-order (code:line)
+                           (code:line #:bit-order bit-order-id)]
+          [maybe-alignment (code:line)
+                           (code:line #:alignment nat)]
+          [field-spec (field-name type-id width-expr field-option ...)
+                      (field-name type-id #:align nat)
+                      (field-name struct-name #:struct)]
+          [field-option (code:line #:byte-order byte-order-id)
+                        (code:line #:unit unit-id)
+                        (code:line #:bit-order bit-order-id)
+                        (code:line #:compute expr)
+                        (code:line #:contract expr)
+                        (code:line #:present-when expr)
+                        (code:line #:default expr)
+                        (code:line #:enum expr)
+                        (code:line #:terminator nat)
+                        (code:line #:repeat expr)
+                        (code:line #:repeat-until expr)])]{
+
+Defines a binary wire structure and introduces:
 
 @itemlist[
-  @item{@racketvarfont{name} — a @racket[protocol-desc] value describing the layout
-    (also usable as a @racket[match] expander)}
-  @item{@racketvarfont{name}@racketidfont{?} — predicate recognizing decoded instances}
-  @item{@racketvarfont{name}@racketidfont{-encode} — encodes field values (given as
-    keyword arguments) to @racket[bytes]}
-  @item{@racketvarfont{name}@racketidfont{-decode} — decodes @racket[bytes] to a wire
-    struct instance (a zero-copy view over the raw bytes)}
-  @item{@racketvarfont{name}@racketidfont{-}@racketvarfont{field} — one accessor per
-    field, decoding the field value on demand from the held bytes}
-]
-
-The optional @racket[#:byte-order] clause sets the default byte order
-for all fields (defaults to @racket[big]). Individual fields can
-override with their own @racket[#:byte-order] clause.
-
-@racketblock[
-(struct/wire pcap-record
-  #:byte-order little
-  (ts-sec    uint 4)
-  (ts-usec   uint 4)
-  (incl-len  uint 4)
-  (orig-len  uint 4))
-
-(struct/wire mixed
-  #:byte-order big
-  (network-field  uint 2)
-  (host-field     uint 2 #:byte-order little))
+  @item{@racketvarfont{name} — a @racket[protocol-desc] value (also a
+    @racket[match] expander)}
+  @item{@racketvarfont{name}@racketidfont{?} — predicate}
+  @item{@racketvarfont{name}@racketidfont{-encode} — keyword args → @racket[bytes]}
+  @item{@racketvarfont{name}@racketidfont{-decode} — @racket[bytes] → wire struct
+    instance (zero-copy)}
+  @item{@racketvarfont{name}@racketidfont{-}@racketvarfont{field} — accessor per
+    non-padding field}
 ]}
 
-@subsection{Encoding}
+@subsection{Field Types}
 
-The generated @racketvarfont{name}@racketidfont{-encode} function takes one
-keyword argument per field (in any order) and returns a @racket[bytes] value:
+@tabular[#:style 'boxed
+         #:column-properties '(left left left)
+         (list (list @bold{Type} @bold{Width} @bold{Description})
+               (list @racket[uint] "N bytes" "Unsigned integer")
+               (list @racket[sint] "N bytes" "Signed two's complement")
+               (list @racket[alpha] "N bytes" "ASCII, space-padded (or null-terminated with #:terminator)")
+               (list @racket[octets] "N bytes" "Raw bytes")
+               (list @racket[float32] "4 bytes" "IEEE 754 single-precision")
+               (list @racket[float64] "8 bytes" "IEEE 754 double-precision")
+               (list @racket[bcd] "N bytes" "Packed BCD (two digits per byte)")
+               (list @racket[bool] "1 byte"  "Boolean: 0 = #f, nonzero = #t")
+               (list @racket[utf8] "N bytes" "UTF-8 string, null-padded")
+               (list @racket[utf16] "N bytes" "UTF-16 string, byte-order aware")
+               (list @racket[utf32] "N bytes" "UTF-32 string, byte-order aware")
+               (list @racket[padding] "N bytes" "Zero bytes, skipped on decode"))]
+
+@subsection{Bitfields}
+
+Fields can be specified in bits rather than bytes using @racket[#:unit bits]:
 
 @racketblock[
-(pcap-record-encode
- #:ts-sec   1616000000
- #:ts-usec  123456
- #:incl-len 64
- #:orig-len 64)
+(struct/wire ipv4-header
+  #:byte-order big
+  (version          uint 4  #:unit bits)
+  (ihl              uint 4  #:unit bits)
+  (dscp             uint 6  #:unit bits)
+  (ecn              uint 2  #:unit bits)
+  (total-length     uint 2)
+  ...)
 ]
 
-@subsection{Decoding}
+Contiguous bitfields form a group that must sum to a whole number of bytes.
+Bit ordering defaults to MSB-first but can be overridden with
+@racket[#:bit-order lsb] at the protocol, group, or field level.
 
-The generated @racketvarfont{name}@racketidfont{-decode} function takes a
-@racket[bytes] value and an optional @racket[#:offset], returning a wire struct
-instance. The instance holds a reference to the original bytes and decodes
-fields lazily through accessors — no upfront parsing cost.
+@subsection{Variable-Length Fields}
+
+A field's width can depend on another field's value:
 
 @racketblock[
-(define v (pcap-record-decode raw-bytes #:offset 24))
-(pcap-record-ts-sec v)
-(pcap-record-incl-len v)
+(struct/wire pcap-packet
+  #:byte-order little
+  (ts-sec    uint   4)
+  (ts-usec   uint   4)
+  (incl-len  uint   4)
+  (orig-len  uint   4)
+  (data      octets (field-ref incl-len)))
 ]
 
-@subsection{Pattern Matching}
-
-Wire struct names serve as @racket[match] expanders. Use keyword patterns to
-bind only the fields you need:
+Use @racket[(compute expr)] for arithmetic on field references:
 
 @racketblock[
-(match (itch-trade-decode raw-bytes)
-  [(itch-trade #:stock sym #:price p #:shares s)
-   (printf "~a: ~a shares @ ~a\n" sym s p)])
+(options octets (compute (* (- (field-ref ihl) 5) 4)))
 ]
 
-Matching with no keywords tests only the predicate:
+@subsection{Computed Fields}
+
+Fields with @racket[#:compute] are auto-calculated during encoding.
+The compute function receives the encoded buffer (with the field zeroed)
+and returns the field's value. Computed fields are omitted from encode
+keyword arguments.
 
 @racketblock[
-(match v
-  [(itch-trade) (displayln "it's a trade")]
-  [_ (displayln "something else")])
+(struct/wire checksummed-msg
+  #:byte-order big
+  (data           uint 4)
+  (header-checksum uint 2 #:compute ipv4-header-checksum))
+]
+
+@subsection{Conditional Fields}
+
+Fields with @racket[#:present-when] are included only when the predicate
+returns true. The predicate receives a lookup function over already-decoded
+field values. Absent fields decode as @racket[#f].
+
+@racketblock[
+(struct/wire optional-msg
+  #:byte-order big
+  (flags   uint 1)
+  (payload uint 4 #:present-when (λ (lk) (> (lk 'flags) 0))))
+]
+
+@subsection{Contracts}
+
+@racket[#:contract] attaches a predicate checked at encode time:
+
+@racketblock[
+(struct/wire validated-msg
+  #:byte-order big
+  (port uint 2 #:contract (λ (v) (<= 0 v 65535)))
+  (ttl  uint 1 #:contract (λ (v) (> v 0))))
+]
+
+@subsection{Default Values}
+
+Fields with @racket[#:default] become optional keyword arguments:
+
+@racketblock[
+(struct/wire ipv4-header
+  #:byte-order big
+  (version uint 4 #:unit bits #:default 4)
+  (ihl     uint 4 #:unit bits #:default 5)
+  ...)
+
+(code:comment "version and ihl can be omitted:")
+(ipv4-header-encode #:total-length 1500 ...)
+]
+
+@subsection{Enums}
+
+@racket[#:enum] auto-converts between symbols and integers:
+
+@racketblock[
+(define-wire-enum ip-protocol
+  [tcp 6] [udp 17] [icmp 1])
+
+(struct/wire ipv4-header
+  #:byte-order big
+  ...
+  (protocol uint 1 #:enum ip-protocol)
+  ...)
+
+(code:comment "Encode with symbol:")
+(ipv4-header-encode ... #:protocol 'tcp ...)
+
+(code:comment "Decode returns symbol:")
+(ipv4-header-protocol hdr) (code:comment "'tcp")
+]
+
+@subsection{Repetition}
+
+@racket[#:repeat] creates array fields. The count can be a fixed number
+or a @racket[field-ref]:
+
+@racketblock[
+(struct/wire array-msg
+  #:byte-order big
+  (count uint 1)
+  (items uint 2 #:repeat (field-ref count)))
+]
+
+@racket[#:repeat-until] reads elements until a sentinel predicate matches:
+
+@racketblock[
+(struct/wire sentinel-msg
+  #:byte-order big
+  (items uint 2 #:repeat-until (λ (v) (= v 0))))
+]
+
+@subsection{Padding and Alignment}
+
+Explicit padding fields encode as zeros and generate no accessor:
+
+@racketblock[
+(struct/wire padded
+  #:byte-order big
+  (tag uint 1)
+  (pad padding 3)
+  (val uint 4))
+]
+
+@racket[(padding #:align N)] auto-computes padding to reach an N-byte boundary.
+@racket[#:alignment N] on the protocol inserts alignment padding before each field:
+
+@racketblock[
+(struct/wire aligned
+  #:byte-order big
+  #:alignment 4
+  (tag   uint 1)
+  (value uint 4)
+  (short uint 2)
+  (data  uint 4))
+]
+
+@subsection{Embedded Structs}
+
+A field can embed another wire struct using @racket[#:struct]:
+
+@racketblock[
+(struct/wire inner-hdr
+  #:byte-order big
+  (tag uint 1) (len uint 2))
+
+(struct/wire outer-msg
+  #:byte-order big
+  (header inner-hdr #:struct)
+  (data   uint 4))
+
+(code:comment "Encode: pass pre-encoded bytes")
+(outer-msg-encode #:header (inner-hdr-encode #:tag 1 #:len 4)
+                  #:data #xDEADBEEF)
+
+(code:comment "Decode: accessor returns inner struct instance")
+(inner-hdr-tag (outer-msg-header (outer-msg-decode bs)))
+]
+
+@subsection{Null-Terminated Strings}
+
+@racket[#:terminator] on string fields specifies a terminator byte:
+
+@racketblock[
+(struct/wire c-string-msg
+  #:byte-order big
+  (name alpha 256 #:terminator 0))
 ]
 
 @; ------------------------------------------------------------------
-@section{Field Descriptors}
+@section{Protocol Composition}
+
+@defmodule[wirey/stack]
+
+@defform[(define-stack name
+           wire-struct
+           #:dispatch field-name
+           [(value) wire-struct optional-dispatch ...] ...)]{
+
+Defines a layered protocol stack with field-value dispatch. Each layer
+is decoded at the current offset, then the dispatch field's value
+determines which wire struct to decode next.
+
+@racketblock[
+(define-stack ethernet/ip-stack
+  ethernet-header
+  #:dispatch ethertype
+  [(#x0800)
+   ipv4-header
+   #:dispatch protocol
+   [(6)  tcp-header]
+   [(17) udp-header]])
+
+(define result (ethernet/ip-stack-decode packet-bytes))
+(define ip (stack-ref result ipv4-header?))
+(ipv4-header-src-ip ip)
+]}
+
+@defproc[(stack-ref [sv stack-value?] [pred (-> any/c boolean?)]) any/c]{
+Finds a decoded layer instance by predicate, or @racket[#f].}
+
+@; ------------------------------------------------------------------
+@section{Message Dispatch}
+
+@defmodule[wirey/dispatch]
+
+@defform[(define-dispatch name
+           #:offset nat
+           #:width nat
+           #:type type-id
+           [(value) wire-struct] ...)]{
+
+Defines a discriminator-based message dispatch. Reads a field at the
+specified offset/width, looks up the wire struct in an O(1) hash table,
+and decodes the full message. Returns @racket[#f] for unknown values.
+
+@racketblock[
+(define-dispatch itch-message
+  #:offset 0
+  #:width  1
+  #:type   alpha
+  [("S") itch-system-event]
+  [("A") itch-add-order]
+  [("P") itch-trade])
+
+(match (itch-message-decode raw-bytes)
+  [(itch-add-order #:stock sym #:price p)
+   (printf "Order: ~a @ ~a\n" sym p)]
+  [(itch-trade #:stock sym #:price p)
+   (printf "Trade: ~a @ ~a\n" sym p)])
+]}
+
+@; ------------------------------------------------------------------
+@section{Checksums}
+
+@defmodule[wirey/checksum]
+
+@defproc[(internet-checksum [data bytes?]) exact-nonneg-integer?]{
+Computes the RFC 1071 internet checksum: the one's complement of the
+one's complement sum of 16-bit words. Returns a 16-bit value.}
+
+@defproc[(ipv4-header-checksum [header-bytes bytes?]) exact-nonneg-integer?]{
+Computes the IPv4 header checksum. The checksum field (bytes 10--11)
+should be zeroed in the input.}
+
+@; ------------------------------------------------------------------
+@section{Enumerated Types}
+
+@defmodule[wirey/enum]
+
+@defform[(define-wire-enum name [symbol value] ...)]{
+Defines a bidirectional mapping between symbols and integer values.}
+
+@defproc[(wire-enum? [v any/c]) boolean?]{
+Returns @racket[#t] if @racket[v] is a wire enum.}
+
+@defproc[(wire-enum-ref [we wire-enum?] [val (or/c symbol? integer?)]) integer?]{
+Resolves a value for encoding: symbols are mapped to integers,
+integers pass through.}
+
+@defproc[(wire-enum-lookup [we wire-enum?] [val integer?]) (or/c symbol? integer?)]{
+Resolves a value for decoding: known integers are mapped to symbols,
+unknown integers pass through.}
+
+@; ------------------------------------------------------------------
+@section{Length Expressions}
+
+@defmodule[wirey/length-expr]
+
+Length expressions describe variable field widths.
+
+@defproc[(make-field-ref [name symbol?]) field-ref?]{
+Creates a length expression that references another field's decoded value.}
+
+@defproc[(make-compute [source any/c] [fn (-> (-> symbol? any/c) any/c)]) compute?]{
+Creates a length expression computed from a function over field values.
+The function receives a lookup procedure @racket[(symbol? -> any/c)].}
+
+@defproc[(eval-length-expr [expr length-expr?] [lookup (-> symbol? any/c)]) exact-nonneg-integer?]{
+Evaluates a length expression given a field lookup function.}
+
+@; ------------------------------------------------------------------
+@section{Data-Driven Layer}
+
+@subsection{Field Descriptors}
 
 @defmodule[wirey/field]
 
-A @deftech{field descriptor} describes a single field in a binary layout:
-its name, type, byte width, and byte order.
-
 @defproc[(make-field-desc [name symbol?]
                           [type field-type?]
-                          [width exact-positive-integer?]
-                          [byte-order byte-order?])
+                          [width (or/c exact-positive-integer? field-ref? compute?)]
+                          [byte-order byte-order?]
+                          [#:unit unit field-unit? 'bytes]
+                          [#:bit-order bit-order (or/c bit-order? #f) #f]
+                          [#:compute compute-fn (or/c procedure? #f) #f]
+                          [#:contract contract-fn (or/c procedure? #f) #f]
+                          [#:present-when present-fn (or/c procedure? #f) #f]
+                          [#:terminator term (or/c exact-nonneg-integer? #f) #f]
+                          [#:repeat repeat-count (or/c exact-positive-integer? field-ref? #f) #f]
+                          [#:repeat-until repeat-pred (or/c procedure? #f) #f])
          field-desc?]{
-Creates a field descriptor. Raises @racket[exn:fail?] if any argument
-is invalid.}
+Creates a field descriptor with full control over all field options.}
 
-@defproc[(field-desc? [v any/c]) boolean?]{
-Returns @racket[#t] if @racket[v] is a field descriptor.}
-
-@defproc[(field-desc-name [fd field-desc?]) symbol?]{
-The field's symbolic name.}
-
-@defproc[(field-desc-type [fd field-desc?]) field-type?]{
-The field's type.}
-
-@defproc[(field-desc-width [fd field-desc?]) exact-positive-integer?]{
-The field's width in bytes.}
-
-@defproc[(field-desc-byte-order [fd field-desc?]) byte-order?]{
-The field's byte order.}
-
-@defproc[(field-type? [v any/c]) boolean?]{
-Returns @racket[#t] if @racket[v] is a valid field type symbol.
-Valid types are:
-
-@itemlist[
-  @item{@racket['uint] — unsigned integer}
-  @item{@racket['sint] — signed integer (two's complement)}
-  @item{@racket['alpha] — fixed-width ASCII string, right-padded with spaces}
-  @item{@racket['octets] — raw bytes}
-]}
-
-@defproc[(byte-order? [v any/c]) boolean?]{
-Returns @racket[#t] if @racket[v] is a valid byte order symbol:
-@racket['big] or @racket['little].}
-
-@; ------------------------------------------------------------------
-@section{Protocol Descriptors}
+@subsection{Protocol Descriptors}
 
 @defmodule[wirey/protocol]
-
-A @deftech{protocol descriptor} groups a sequence of field descriptors
-into a named binary message format.
 
 @defproc[(make-protocol-desc [name symbol?]
                              [fields (listof field-desc?)])
          protocol-desc?]{
-Creates a protocol descriptor. Raises @racket[exn:fail?] if any argument
-is invalid.}
-
-@defproc[(protocol-desc? [v any/c]) boolean?]{
-Returns @racket[#t] if @racket[v] is a protocol descriptor.}
-
-@defproc[(protocol-desc-name [pd protocol-desc?]) symbol?]{
-The protocol's symbolic name.}
-
-@defproc[(protocol-desc-fields [pd protocol-desc?]) (listof field-desc?)]{
-The protocol's ordered list of field descriptors.}
+Creates a protocol descriptor. Validates bitfield groups sum to whole bytes
+and variable-length field references are valid.}
 
 @defproc[(protocol-desc-total-size [pd protocol-desc?]) exact-nonneg-integer?]{
-The total size of the protocol in bytes (sum of all field widths).}
+Total fixed-portion size in bytes. Variable-length and conditional fields
+are excluded.}
 
-@defproc[(protocol-desc-field-ref [pd protocol-desc?]
-                                  [name symbol?])
-         (or/c field-desc? #f)]{
-Looks up a field by name. Returns @racket[#f] if no field with
-the given name exists.}
-
-@; ------------------------------------------------------------------
-@section{Codec}
+@subsection{Codec}
 
 @defmodule[wirey/codec]
-
-The codec module provides generic encode and decode operations
-that work with any @tech{protocol descriptor}. These are the low-level
-data-driven functions that @racket[struct/wire] builds upon.
 
 @defproc[(encode [pd protocol-desc?]
                  [values (hash/c symbol? any/c)])
          bytes?]{
-Encodes @racket[values] according to the protocol descriptor @racket[pd].
-The @racket[values] hash must contain an entry for every field name in the
-protocol. Returns a byte string of length @racket[(protocol-desc-total-size pd)].
-
-Encoding rules by field type:
-
-@itemlist[
-  @item{@racket['uint] — value must be an exact non-negative integer.
-    Encoded in the field's byte order.}
-  @item{@racket['sint] — value must be an exact integer.
-    Encoded as two's complement in the field's byte order.}
-  @item{@racket['alpha] — value must be a string. Left-justified and
-    right-padded with spaces to the field width. Truncated if longer.}
-  @item{@racket['octets] — value must be a byte string. Copied directly.
-    Truncated if longer than the field width.}
-]}
+Encodes values according to the protocol descriptor. Handles bitfields,
+variable-length fields, computed fields (two-pass), conditional fields,
+repeated fields, and contract validation.}
 
 @defproc[(decode [pd protocol-desc?]
                  [data bytes?]
                  [#:offset offset exact-nonneg-integer? 0])
          (hash/c symbol? any/c)]{
-Decodes @racket[data] starting at @racket[offset] according to the
-protocol descriptor @racket[pd]. Returns a hash mapping field names
-to decoded values.
-
-Decoding rules by field type:
-
-@itemlist[
-  @item{@racket['uint] — returns an exact non-negative integer.}
-  @item{@racket['sint] — returns an exact integer (negative values
-    reconstructed from two's complement).}
-  @item{@racket['alpha] — returns a string with trailing spaces removed.}
-  @item{@racket['octets] — returns a byte string.}
-]}
-
-@defproc[(decode-field [data bytes?]
-                       [offset exact-nonneg-integer?]
-                       [fd field-desc?])
-         any/c]{
-Decodes a single field from @racket[data] at the given byte @racket[offset],
-according to the field descriptor @racket[fd]. Used internally by wire
-struct accessors for on-demand field decoding.}
+Decodes data according to the protocol descriptor. Handles all field
+types including conditional (absent → @racket[#f]) and repeated
+(→ list) fields.}
 
 @; ------------------------------------------------------------------
-@section{Bundled Wire Structures}
-
-Wirey ships with wire structure definitions for several common protocols.
-Each definition provides the standard set of bindings generated by
-@racket[struct/wire]: a protocol descriptor, predicate, encoder (keyword args),
-decoder, field accessors, and match expander.
+@section{Bundled Protocols}
 
 @subsection{ITCH 5.0}
-
 @defmodule[wirey/protocols/itch]
 
-NASDAQ TotalView-ITCH 5.0 message definitions. All fields are big-endian.
-Prices are unsigned integers with implied decimal places (not encoded on
-the wire).
+NASDAQ TotalView-ITCH 5.0 messages (big-endian):
+@racket[itch-system-event], @racket[itch-add-order],
+@racket[itch-add-order-mpid], @racket[itch-order-executed],
+@racket[itch-order-delete], @racket[itch-trade].
 
-Defined wire structures:
+@subsection{Network Headers}
+@defmodule[wirey/protocols/ipv4]
+@racket[ipv4-header] — 20-byte IPv4 header with bitfields.
 
-@itemlist[
-  @item{@racket[itch-system-event] — System Event (type @racket["S"], 12 bytes)}
-  @item{@racket[itch-add-order] — Add Order without MPID (type @racket["A"], 36 bytes)}
-  @item{@racket[itch-add-order-mpid] — Add Order with MPID (type @racket["F"], 40 bytes)}
-  @item{@racket[itch-order-executed] — Order Executed (type @racket["E"], 31 bytes)}
-  @item{@racket[itch-order-delete] — Order Delete (type @racket["D"], 19 bytes)}
-  @item{@racket[itch-trade] — Trade, Non-Cross (type @racket["P"], 44 bytes)}
-]
-
-@subsection{PCAP}
-
-@defmodule[wirey/protocols/pcap]
-
-PCAP capture file headers. Default byte order is little-endian
-(the common case for native captures).
-
-@itemlist[
-  @item{@racket[pcap-global-header] — Global file header (24 bytes)}
-  @item{@racket[pcap-record-header] — Per-packet record header (16 bytes)}
-]
-
-@subsection{Ethernet}
-
-@defmodule[wirey/protocols/ethernet]
-
-@itemlist[
-  @item{@racket[ethernet-header] — Ethernet frame header (14 bytes):
-    destination MAC, source MAC, and EtherType}
-]
-
-@subsection{UDP}
+@defmodule[wirey/protocols/tcp]
+@racket[tcp-header] — 20-byte TCP header with flag bitfields.
 
 @defmodule[wirey/protocols/udp]
+@racket[udp-header] — 8-byte UDP header.
 
-@itemlist[
-  @item{@racket[udp-header] — UDP datagram header (8 bytes)}
-]
+@defmodule[wirey/protocols/ethernet]
+@racket[ethernet-header] — 14-byte Ethernet frame header.
+
+@subsection{PCAP}
+@defmodule[wirey/protocols/pcap]
+@racket[pcap-global-header] (24 bytes),
+@racket[pcap-record-header] (16 bytes),
+@racket[pcap-packet] (header + variable-length data).
+
+@subsection{Protocol Stacks}
+@defmodule[wirey/protocols/stacks]
+@racket[ethernet/ip-stack] — Ethernet → IPv4 → TCP/UDP.
+
+@; ------------------------------------------------------------------
+@section{Scope and Limitations}
+
+Wirey targets @bold{fixed-layout and semi-fixed-layout} binary protocols:
+formats where the structure is determined by header fields and can be
+described as a flat sequence of fields with conditional presence,
+variable lengths, and dispatch tables.
+
+Wirey @bold{does not} target self-describing recursive formats such as
+CBOR, ASN.1 BER/DER, Protocol Buffers, or MessagePack. These formats
+require recursive type definitions, N-way conditional structures within
+a single message, and variable-width self-describing integer encodings
+that are beyond wirey's flat field model.
+
+Protocols well-suited to wirey include:
+ITCH, FIX/FAST, Ethernet/IPv4/TCP/UDP, PCAP, DNS (headers),
+USB descriptors, Bluetooth HCI, SPI/I2C register maps,
+and most hardware-oriented binary formats.

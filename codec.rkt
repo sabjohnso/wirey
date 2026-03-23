@@ -25,6 +25,12 @@
 
 (define (encode pd values)
   (define fields (protocol-desc-fields pd))
+  ;; For computed fields, use 0 as placeholder in values
+  (define effective-values
+    (for/fold ([v values]) ([f (in-list fields)])
+      (if (field-desc-computed? f)
+          (hash-set v (field-desc-name f) 0)
+          v)))
   ;; Compute total size by resolving all widths
   (define total
     (let loop ([fields fields] [bit-acc 0] [total 0])
@@ -35,18 +41,19 @@
          (loop (cdr fields) (+ bit-acc (field-desc-width (car fields))) total)]
         [else
          (define flush (if (zero? bit-acc) 0 (quotient bit-acc 8)))
-         (define w (resolve-width (car fields) values))
+         (define w (resolve-width (car fields) effective-values))
          (loop (cdr fields) 0 (+ total flush w))])))
   (define buf (make-bytes total 0))
+  ;; First pass: encode all fields (computed fields get 0)
+  (define computed-fields '()) ;; list of (field-desc . byte-offset)
   (let loop ([fields fields] [byte-off 0] [bit-acc 0] [bit-count 0])
     (cond
       [(null? fields)
        (when (> bit-count 0)
-         (flush-bits! buf byte-off bit-acc bit-count))
-       buf]
+         (flush-bits! buf byte-off bit-acc bit-count))]
       [(eq? (field-desc-unit (car fields)) 'bits)
        (define f (car fields))
-       (define val (hash-ref values (field-desc-name f)))
+       (define val (hash-ref effective-values (field-desc-name f)))
        (define w (field-desc-width f))
        (define new-acc (bitwise-ior (arithmetic-shift bit-acc w)
                                     (bitwise-and val (sub1 (arithmetic-shift 1 w)))))
@@ -65,17 +72,28 @@
              0))
        (define f (car fields))
        (define off (+ byte-off flush-bytes))
-       (define w (resolve-width f values))
+       (define w (resolve-width f effective-values))
        ;; Validate variable-length data consistency
        (when (field-desc-variable-length? f)
-         (define val (hash-ref values (field-desc-name f)))
+         (define val (hash-ref effective-values (field-desc-name f)))
          (when (bytes? val)
            (unless (= (bytes-length val) w)
              (error 'encode
                     "field '~a': length expression evaluates to ~a but data is ~a bytes"
                     (field-desc-name f) w (bytes-length val)))))
-       (encode-field! buf off f w (hash-ref values (field-desc-name f)))
+       ;; Track computed fields for second pass
+       (when (field-desc-computed? f)
+         (set! computed-fields (cons (cons f off) computed-fields)))
+       (encode-field! buf off f w (hash-ref effective-values (field-desc-name f)))
        (loop (cdr fields) (+ off w) 0 0)]))
+  ;; Second pass: compute and write computed field values
+  (for ([entry (in-list computed-fields)])
+    (define f (car entry))
+    (define off (cdr entry))
+    (define compute-fn (field-desc-compute f))
+    (define computed-val (compute-fn buf))
+    (define w (field-desc-width f))
+    (encode-field! buf off f w computed-val))
   buf)
 
 ;; Write accumulated bits to buffer as big-endian bytes

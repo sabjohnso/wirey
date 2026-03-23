@@ -137,6 +137,22 @@
       (check-exn exn:fail?
         (λ () (make-field-desc 'a 'uint (make-field-ref 'x) 'big #:unit 'bits))))))
 
+(describe "field-desc-compute"
+  (it "defaults to #f (no compute function)"
+    (define f (make-field-desc 'val 'uint 4 'big))
+    (check-false (field-desc-compute f)))
+
+  (it "stores a compute function when provided"
+    (define (my-checksum buf) 42)
+    (define f (make-field-desc 'chk 'uint 2 'big #:compute my-checksum))
+    (check-equal? (field-desc-compute f) my-checksum))
+
+  (it "computed? predicate works"
+    (define f1 (make-field-desc 'val 'uint 4 'big))
+    (define f2 (make-field-desc 'chk 'uint 2 'big #:compute (λ (buf) 0)))
+    (check-false (field-desc-computed? f1))
+    (check-true (field-desc-computed? f2))))
+
 (describe "field-desc-width-in-bits"
   (it "returns width * 8 for byte-unit fields"
     (define f (make-field-desc 'val 'uint 2 'big))

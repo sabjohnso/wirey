@@ -12,6 +12,8 @@
          field-desc-width
          field-desc-byte-order
          field-desc-unit
+         field-desc-compute
+         field-desc-computed?
          field-desc-width-in-bits
          field-desc-variable-length?)
 
@@ -37,12 +39,13 @@
 (define (bitfield-type? v)
   (memq v '(uint sint)))
 
-;; Internal struct
-(struct field-desc (name type width byte-order unit) #:transparent)
+;; Internal struct — 6th field is the optional compute function
+(struct field-desc (name type width byte-order unit compute) #:transparent)
 
 ;; Validated constructor
-;; width can be: exact-positive-integer?, field-ref?, or compute?
-(define (make-field-desc name type width byte-order #:unit [unit 'bytes])
+(define (make-field-desc name type width byte-order
+                         #:unit [unit 'bytes]
+                         #:compute [compute-fn #f])
   (unless (symbol? name)
     (error 'make-field-desc "name must be a symbol, got: ~e" name))
   (unless (field-type? type)
@@ -61,7 +64,13 @@
   (when (and (eq? unit 'bits) (not (exact-positive-integer? width)))
     (error 'make-field-desc
            "bit-unit fields must have fixed width, got: ~e" width))
-  (field-desc name type width byte-order unit))
+  (when (and compute-fn (not (procedure? compute-fn)))
+    (error 'make-field-desc "#:compute must be a procedure, got: ~e" compute-fn))
+  (field-desc name type width byte-order unit compute-fn))
+
+;; Is this a computed field?
+(define (field-desc-computed? fd)
+  (and (field-desc-compute fd) #t))
 
 ;; Is this a variable-length field?
 (define (field-desc-variable-length? fd)

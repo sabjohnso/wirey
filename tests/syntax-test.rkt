@@ -6,7 +6,8 @@
          wirey/field
          wirey/protocol
          wirey/syntax
-         wirey/length-expr)
+         wirey/length-expr
+         wirey/checksum)
 
 ;; -- helpers --
 (define (hex->bytes str)
@@ -291,3 +292,45 @@
          (check-equal? t #xAA)
          (check-equal? d (bytes #xBB #xCC))
          (check-equal? c #xDDEE)]))))
+
+;; Test computed fields in struct/wire
+(define (simple-sum-checksum buf)
+  (define total 0)
+  (for ([i (in-range (bytes-length buf))])
+    (set! total (+ total (bytes-ref buf i))))
+  (modulo total 256))
+
+(struct/wire checksummed-msg
+  #:byte-order big
+  (tag  uint 1)
+  (data uint 2)
+  (chk  uint 1 #:compute simple-sum-checksum))
+
+(describe "struct/wire with computed fields"
+  (context "encoding"
+    (it "does not require computed field in keyword args"
+      (define bs (checksummed-msg-encode #:tag #xAA #:data #x0102))
+      (check-equal? (bytes-length bs) 4)
+      ;; chk = (#xAA + #x01 + #x02 + 0) mod 256 = #xAD
+      (check-equal? (bytes-ref bs 3) #xAD))
+
+    (it "computes correct checksum"
+      (define bs (checksummed-msg-encode #:tag #x10 #:data #x2030))
+      ;; chk = (#x10 + #x20 + #x30 + 0) mod 256 = #x60
+      (check-equal? (bytes-ref bs 3) #x60)))
+
+  (context "decoding"
+    (it "decodes computed fields normally"
+      (define bs (checksummed-msg-encode #:tag #xAA #:data #x0102))
+      (define v (checksummed-msg-decode bs))
+      (check-equal? (checksummed-msg-tag v) #xAA)
+      (check-equal? (checksummed-msg-data v) #x0102)
+      (check-equal? (checksummed-msg-chk v) #xAD)))
+
+  (context "match"
+    (it "matches computed field values"
+      (define bs (checksummed-msg-encode #:tag #xAA #:data #x0102))
+      (match (checksummed-msg-decode bs)
+        [(checksummed-msg #:tag t #:chk c)
+         (check-equal? t #xAA)
+         (check-equal? c #xAD)]))))

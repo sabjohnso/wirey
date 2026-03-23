@@ -402,3 +402,33 @@
                         (make-field-desc 'crc  'uint   2 'big))))
       (define v (hasheq 'tag #xAA 'len 5 'data (bytes 1 2 3 4 5) 'crc #x1234))
       (check-equal? (decode p (encode p v)) v))))
+
+;; ===== Computed Fields Encoding =====
+
+(describe "encode (computed fields)"
+  (it "computes a field value via two-pass encoding"
+    ;; Simple checksum: sum of all other bytes mod 256
+    (define (simple-checksum buf)
+      (define total 0)
+      (for ([i (in-range (bytes-length buf))])
+        (set! total (+ total (bytes-ref buf i))))
+      (modulo total 256))
+    (define p (make-protocol-desc 'msg
+                (list (make-field-desc 'tag  'uint 1 'big)
+                      (make-field-desc 'data 'uint 2 'big)
+                      (make-field-desc 'chk  'uint 1 'big #:compute simple-checksum))))
+    ;; Encode without providing 'chk — it should be computed
+    (define bs (encode p (hasheq 'tag #xAA 'data #x0102)))
+    ;; chk = (#xAA + #x01 + #x02 + 0) mod 256 = #xAD
+    (check-equal? (bytes-ref bs 3) #xAD)
+    ;; The other fields should be correct
+    (check-equal? (bytes-ref bs 0) #xAA)
+    (check-equal? (subbytes bs 1 3) (bytes #x01 #x02)))
+
+  (it "ignores a provided value for computed fields"
+    (define (always-42 buf) 42)
+    (define p (make-protocol-desc 'msg
+                (list (make-field-desc 'val 'uint 1 'big)
+                      (make-field-desc 'chk 'uint 1 'big #:compute always-42))))
+    (define bs (encode p (hasheq 'val 99 'chk 0)))
+    (check-equal? (bytes-ref bs 1) 42)))

@@ -161,16 +161,16 @@
                    #:defaults ([default-bo #'big]))
         field-clause ...)
 
-     ;; Parse field clauses: (name type width-stx byte-order-or-#f unit-or-#f)
-     ;; width-stx is either a nat literal or a form like (field-ref name)
+     ;; Parse field clauses: (name type width-stx byte-order-or-#f unit-or-#f compute-or-#f)
      (define field-infos
        (for/list ([fc (in-list (syntax->list #'(field-clause ...)))])
          (syntax-parse fc
            [(fname:id ftype:id fwidth
                       (~optional (~seq #:byte-order fbo:id))
-                      (~optional (~seq #:unit funit:id)))
+                      (~optional (~seq #:unit funit:id))
+                      (~optional (~seq #:compute fcompute:expr)))
             (list #'fname #'ftype #'fwidth
-                  (attribute fbo) (attribute funit))])))
+                  (attribute fbo) (attribute funit) (attribute fcompute))])))
 
      (define field-names  (map first field-infos))
      (define field-widths (map third field-infos))
@@ -251,6 +251,9 @@
            w-stx))
 
      ;; Field descriptor expressions
+     (define (field-computed? info)
+       (and (sixth info) #t))
+
      (define fd-exprs
        (for/list ([info field-infos])
          (define fn (first info))
@@ -258,28 +261,42 @@
          (define fw-stx (third info))
          (define fb (fourth info))
          (define fu (fifth info))
+         (define fc (sixth info))
          (define bo-expr (if fb #`'#,fb #`'default-bo))
          (define width-arg (width-stx->expr fw-stx))
-         (if fu
-             #`(make-field-desc '#,fn '#,ft #,width-arg #,bo-expr #:unit '#,fu)
-             #`(make-field-desc '#,fn '#,ft #,width-arg #,bo-expr))))
+         (define base
+           (if fu
+               #`(make-field-desc '#,fn '#,ft #,width-arg #,bo-expr #:unit '#,fu)
+               #`(make-field-desc '#,fn '#,ft #,width-arg #,bo-expr)))
+         (if fc
+             ;; Add #:compute to the make-field-desc call
+             (if fu
+                 #`(make-field-desc '#,fn '#,ft #,width-arg #,bo-expr
+                                    #:unit '#,fu #:compute #,fc)
+                 #`(make-field-desc '#,fn '#,ft #,width-arg #,bo-expr
+                                    #:compute #,fc))
+             base)))
 
-     ;; Encode function formals (sorted keyword args)
-     (define sorted-params
-       (for/list ([i sorted-idxs])
+     ;; Encode function formals: exclude computed fields from keyword args
+     (define encode-sorted-idxs
+       (filter (λ (i) (not (field-computed? (list-ref field-infos i))))
+               sorted-idxs))
+
+     (define encode-sorted-params
+       (for/list ([i encode-sorted-idxs])
          (generate-temporary (list-ref field-names i))))
 
      (define encode-formals
        (apply append
-              (for/list ([i sorted-idxs]
-                         [param sorted-params])
+              (for/list ([i encode-sorted-idxs]
+                         [param encode-sorted-params])
                 (list (datum->syntax #'sname (list-ref field-kws i))
                       param))))
 
      (define encode-hash-pairs
        (apply append
-              (for/list ([i sorted-idxs]
-                         [param sorted-params])
+              (for/list ([i encode-sorted-idxs]
+                         [param encode-sorted-params])
                 (define fn (list-ref field-names i))
                 (list #`'#,fn param))))
 

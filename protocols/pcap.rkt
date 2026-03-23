@@ -22,10 +22,19 @@
   (snaplen        uint   4)
   (network        uint   4))
 
-;; Packet Record Header — 16 bytes
+;; Packet Record Header — 16 bytes (fixed portion)
 (struct/wire pcap-record-header
   #:byte-order little
   (ts-sec    uint 4)
   (ts-usec   uint 4)
   (incl-len  uint 4)
   (orig-len  uint 4))
+
+;; Packet Record — header + variable-length captured data
+(struct/wire pcap-packet
+  #:byte-order little
+  (ts-sec    uint   4)
+  (ts-usec   uint   4)
+  (incl-len  uint   4)
+  (orig-len  uint   4)
+  (data      octets (field-ref incl-len)))

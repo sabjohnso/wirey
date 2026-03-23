@@ -7,7 +7,9 @@
          wirey/protocols/itch
          wirey/protocols/pcap
          wirey/protocols/ethernet
-         wirey/protocols/udp)
+         wirey/protocols/udp
+         wirey/protocols/ipv4
+         wirey/protocols/tcp)
 
 ;; -- helpers --
 (define (hex->bytes str)
@@ -171,6 +173,51 @@
     (check-equal? (pcap-record-header-incl-len v) 64)
     (check-equal? (pcap-record-header-orig-len v) 64)))
 
+(describe "PCAP packet (variable-length)"
+  (it "encodes header + variable-length data"
+    (define bs (pcap-packet-encode
+                #:ts-sec   1000
+                #:ts-usec  500
+                #:incl-len 4
+                #:orig-len 100
+                #:data     (bytes #xDE #xAD #xBE #xEF)))
+    (check-equal? (bytes-length bs) 20))
+
+  (it "decodes variable-length data correctly"
+    (define bs (pcap-packet-encode
+                #:ts-sec   1000
+                #:ts-usec  500
+                #:incl-len 3
+                #:orig-len 64
+                #:data     (bytes 1 2 3)))
+    (define v (pcap-packet-decode bs))
+    (check-equal? (pcap-packet-ts-sec v) 1000)
+    (check-equal? (pcap-packet-incl-len v) 3)
+    (check-equal? (pcap-packet-data v) (bytes 1 2 3)))
+
+  (it "round-trips correctly"
+    (define bs (pcap-packet-encode
+                #:ts-sec   999
+                #:ts-usec  0
+                #:incl-len 6
+                #:orig-len 100
+                #:data     (bytes 10 20 30 40 50 60)))
+    (define v (pcap-packet-decode bs))
+    (check-equal? (pcap-packet-data v) (bytes 10 20 30 40 50 60))
+    (check-equal? (pcap-packet-orig-len v) 100))
+
+  (it "supports match patterns"
+    (define bs (pcap-packet-encode
+                #:ts-sec   1000
+                #:ts-usec  0
+                #:incl-len 2
+                #:orig-len 50
+                #:data     (bytes #xAA #xBB)))
+    (match (pcap-packet-decode bs)
+      [(pcap-packet #:data d #:incl-len len)
+       (check-equal? len 2)
+       (check-equal? d (bytes #xAA #xBB))])))
+
 ;; ===== Ethernet =====
 
 (describe "Ethernet header"
@@ -231,3 +278,118 @@
     (match (udp-header-decode bs)
       [(udp-header #:dst-port dp)
        (check-equal? dp 53)])))
+
+;; ===== IPv4 =====
+
+(describe "IPv4 header"
+  (it "has a total size of 20 bytes"
+    (check-equal? (protocol-desc-total-size ipv4-header) 20))
+
+  (it "decodes a known IPv4 header"
+    ;; Standard IPv4 header: version=4, ihl=5, dscp=0, ecn=0,
+    ;; total-length=1500, id=0xABCD, flags=2(DF), frag=0,
+    ;; ttl=64, protocol=6(TCP), checksum=0x0000,
+    ;; src=192.168.1.1 (0xC0A80101), dst=10.0.0.1 (0x0A000001)
+    (define raw (hex->bytes
+                 "45 00 05 DC AB CD 40 00 40 06 00 00 C0 A8 01 01 0A 00 00 01"))
+    (define v (ipv4-header-decode raw))
+    (check-equal? (ipv4-header-version v) 4)
+    (check-equal? (ipv4-header-ihl v) 5)
+    (check-equal? (ipv4-header-dscp v) 0)
+    (check-equal? (ipv4-header-ecn v) 0)
+    (check-equal? (ipv4-header-total-length v) 1500)
+    (check-equal? (ipv4-header-identification v) #xABCD)
+    (check-equal? (ipv4-header-flags v) 2)
+    (check-equal? (ipv4-header-fragment-offset v) 0)
+    (check-equal? (ipv4-header-ttl v) 64)
+    (check-equal? (ipv4-header-protocol v) 6)
+    (check-equal? (ipv4-header-src-ip v) #xC0A80101)
+    (check-equal? (ipv4-header-dst-ip v) #x0A000001))
+
+  (it "round-trips correctly"
+    (define bs (ipv4-header-encode
+                #:version 4 #:ihl 5
+                #:dscp 0 #:ecn 0
+                #:total-length 1500
+                #:identification #xABCD
+                #:flags 2 #:fragment-offset 0
+                #:ttl 64 #:protocol 6
+                #:header-checksum 0
+                #:src-ip #xC0A80101
+                #:dst-ip #x0A000001))
+    (define v (ipv4-header-decode bs))
+    (check-equal? (ipv4-header-version v) 4)
+    (check-equal? (ipv4-header-ihl v) 5)
+    (check-equal? (ipv4-header-total-length v) 1500)
+    (check-equal? (ipv4-header-flags v) 2)
+    (check-equal? (ipv4-header-ttl v) 64)
+    (check-equal? (ipv4-header-src-ip v) #xC0A80101))
+
+  (it "supports match patterns on mixed byte and bitfields"
+    (define raw (hex->bytes
+                 "45 00 05 DC AB CD 40 00 40 06 00 00 C0 A8 01 01 0A 00 00 01"))
+    (match (ipv4-header-decode raw)
+      [(ipv4-header #:version ver #:protocol proto #:src-ip src)
+       (check-equal? ver 4)
+       (check-equal? proto 6)
+       (check-equal? src #xC0A80101)])))
+
+;; ===== TCP =====
+
+(describe "TCP header"
+  (it "has a total size of 20 bytes"
+    (check-equal? (protocol-desc-total-size tcp-header) 20))
+
+  (it "decodes a known TCP SYN header"
+    ;; src-port=49152, dst-port=80, seq=1000, ack=0,
+    ;; data-offset=5, reserved=0, flags: SYN=1 only,
+    ;; window=65535, checksum=0, urgent=0
+    ;; Byte 12: data-offset=5 → 0101, reserved=000, NS=0 → 01010000 = 0x50
+    ;; Byte 13: CWR=0,ECE=0,URG=0,ACK=0,PSH=0,RST=0,SYN=1,FIN=0 → 00000010 = 0x02
+    (define raw (hex->bytes
+                 "C0 00 00 50 00 00 03 E8 00 00 00 00 50 02 FF FF 00 00 00 00"))
+    (define v (tcp-header-decode raw))
+    (check-equal? (tcp-header-src-port v) #xC000)
+    (check-equal? (tcp-header-dst-port v) 80)
+    (check-equal? (tcp-header-seq-number v) 1000)
+    (check-equal? (tcp-header-ack-number v) 0)
+    (check-equal? (tcp-header-data-offset v) 5)
+    (check-equal? (tcp-header-reserved v) 0)
+    (check-equal? (tcp-header-syn v) 1)
+    (check-equal? (tcp-header-fin v) 0)
+    (check-equal? (tcp-header-ack v) 0)
+    (check-equal? (tcp-header-window-size v) #xFFFF))
+
+  (it "round-trips a TCP SYN-ACK"
+    (define bs (tcp-header-encode
+                #:src-port 80 #:dst-port 49152
+                #:seq-number 5000 #:ack-number 1001
+                #:data-offset 5 #:reserved 0
+                #:ns 0 #:cwr 0 #:ece 0 #:urg 0
+                #:ack 1 #:psh 0 #:rst 0 #:syn 1 #:fin 0
+                #:window-size 65535
+                #:checksum 0 #:urgent-ptr 0))
+    (define v (tcp-header-decode bs))
+    (check-equal? (tcp-header-src-port v) 80)
+    (check-equal? (tcp-header-dst-port v) 49152)
+    (check-equal? (tcp-header-seq-number v) 5000)
+    (check-equal? (tcp-header-ack-number v) 1001)
+    (check-equal? (tcp-header-data-offset v) 5)
+    (check-equal? (tcp-header-syn v) 1)
+    (check-equal? (tcp-header-ack v) 1)
+    (check-equal? (tcp-header-fin v) 0))
+
+  (it "supports match on TCP flags"
+    (define bs (tcp-header-encode
+                #:src-port 80 #:dst-port 49152
+                #:seq-number 5000 #:ack-number 1001
+                #:data-offset 5 #:reserved 0
+                #:ns 0 #:cwr 0 #:ece 0 #:urg 0
+                #:ack 1 #:psh 0 #:rst 0 #:syn 1 #:fin 0
+                #:window-size 65535
+                #:checksum 0 #:urgent-ptr 0))
+    (match (tcp-header-decode bs)
+      [(tcp-header #:syn s #:ack a #:dst-port dp)
+       (check-equal? s 1)
+       (check-equal? a 1)
+       (check-equal? dp 49152)])))

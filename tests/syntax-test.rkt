@@ -5,7 +5,8 @@
          racket/match
          wirey/field
          wirey/protocol
-         wirey/syntax)
+         wirey/syntax
+         wirey/length-expr)
 
 ;; -- helpers --
 (define (hex->bytes str)
@@ -184,3 +185,109 @@
     (define v (mixed-endian-decode bs))
     (check-equal? (mixed-endian-big-field v) #x0102)
     (check-equal? (mixed-endian-little-field v) #x0304)))
+
+;; Test bitfields in struct/wire
+(struct/wire ipv4-start
+  #:byte-order big
+  (version      uint 4  #:unit bits)
+  (ihl          uint 4  #:unit bits)
+  (dscp         uint 6  #:unit bits)
+  (ecn          uint 2  #:unit bits)
+  (total-length uint 2))
+
+(describe "struct/wire with bitfields"
+  (context "encoding"
+    (it "encodes bitfield nibbles and byte field"
+      (define bs (ipv4-start-encode
+                  #:version 4
+                  #:ihl 5
+                  #:dscp 0
+                  #:ecn 0
+                  #:total-length 1500))
+      (check-equal? (bytes-ref bs 0) #x45)
+      (check-equal? (bytes-ref bs 1) #x00)
+      (check-equal? bs (bytes #x45 #x00 #x05 #xDC))))
+
+  (context "decoding with accessors"
+    (it "decodes bitfields correctly"
+      (define v (ipv4-start-decode (bytes #x45 #x00 #x05 #xDC)))
+      (check-equal? (ipv4-start-version v) 4)
+      (check-equal? (ipv4-start-ihl v) 5)
+      (check-equal? (ipv4-start-dscp v) 0)
+      (check-equal? (ipv4-start-ecn v) 0)
+      (check-equal? (ipv4-start-total-length v) 1500)))
+
+  (context "round-trip"
+    (it "encode then decode returns original values"
+      (define bs (ipv4-start-encode
+                  #:version 4 #:ihl 5
+                  #:dscp 46 #:ecn 2
+                  #:total-length 576))
+      (define v (ipv4-start-decode bs))
+      (check-equal? (ipv4-start-version v) 4)
+      (check-equal? (ipv4-start-ihl v) 5)
+      (check-equal? (ipv4-start-dscp v) 46)
+      (check-equal? (ipv4-start-ecn v) 2)
+      (check-equal? (ipv4-start-total-length v) 576)))
+
+  (context "match patterns"
+    (it "matches bitfield values"
+      (define v (ipv4-start-decode (bytes #x45 #x00 #x05 #xDC)))
+      (match v
+        [(ipv4-start #:version ver #:total-length tl)
+         (check-equal? ver 4)
+         (check-equal? tl 1500)]))))
+
+;; Test variable-length struct/wire
+(struct/wire framed-msg
+  #:byte-order big
+  (tag   uint   1)
+  (len   uint   2)
+  (data  octets (field-ref len))
+  (crc   uint   2))
+
+(describe "struct/wire with variable-length fields"
+  (context "encoding"
+    (it "encodes with keyword args"
+      (define bs (framed-msg-encode
+                  #:tag  #xAA
+                  #:len  3
+                  #:data (bytes 1 2 3)
+                  #:crc  #x1234))
+      (check-equal? bs (bytes #xAA #x00 #x03 1 2 3 #x12 #x34))))
+
+  (context "decoding with accessors"
+    (it "decodes fixed and variable fields"
+      (define v (framed-msg-decode (bytes #xAA #x00 #x03 1 2 3 #x12 #x34)))
+      (check-equal? (framed-msg-tag v) #xAA)
+      (check-equal? (framed-msg-len v) 3)
+      (check-equal? (framed-msg-data v) (bytes 1 2 3))
+      (check-equal? (framed-msg-crc v) #x1234))
+
+    (it "handles different data lengths"
+      (define v (framed-msg-decode (bytes #xBB #x00 #x01 #xFF #xDD #xEE)))
+      (check-equal? (framed-msg-len v) 1)
+      (check-equal? (framed-msg-data v) (bytes #xFF))
+      (check-equal? (framed-msg-crc v) #xDDEE)))
+
+  (context "round-trip"
+    (it "encode then decode returns original values"
+      (define bs (framed-msg-encode
+                  #:tag  #xCC
+                  #:len  4
+                  #:data (bytes 10 20 30 40)
+                  #:crc  #x5678))
+      (define v (framed-msg-decode bs))
+      (check-equal? (framed-msg-tag v) #xCC)
+      (check-equal? (framed-msg-len v) 4)
+      (check-equal? (framed-msg-data v) (bytes 10 20 30 40))
+      (check-equal? (framed-msg-crc v) #x5678)))
+
+  (context "match patterns"
+    (it "matches variable-length struct fields"
+      (define v (framed-msg-decode (bytes #xAA #x00 #x02 #xBB #xCC #xDD #xEE)))
+      (match v
+        [(framed-msg #:tag t #:data d #:crc c)
+         (check-equal? t #xAA)
+         (check-equal? d (bytes #xBB #xCC))
+         (check-equal? c #xDDEE)]))))

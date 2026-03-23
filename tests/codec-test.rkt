@@ -4,7 +4,8 @@
          rackunit/spec
          wirey/field
          wirey/protocol
-         wirey/codec)
+         wirey/codec
+         wirey/length-expr)
 
 ;; -- helpers --
 (define (hex->bytes str)
@@ -198,4 +199,206 @@
                         'tracking     42
                         'timestamp    #x00000E4E1C00
                         'event-code   "O"))
+      (check-equal? (decode p (encode p v)) v))))
+
+;; ===== Bitfield Encoding =====
+
+(describe "encode (bitfields)"
+  (context "two 4-bit nibbles in one byte"
+    (it "encodes version=4, ihl=5 as 0x45"
+      (define p (make-protocol-desc 'test
+                  (list (make-field-desc 'version 'uint 4 'big #:unit 'bits)
+                        (make-field-desc 'ihl     'uint 4 'big #:unit 'bits))))
+      (check-equal? (encode p (hasheq 'version 4 'ihl 5))
+                    (bytes #x45))))
+
+  (context "3+13 bit split across two bytes"
+    (it "encodes flags=2, fragment-offset=0 as 0x4000"
+      (define p (make-protocol-desc 'test
+                  (list (make-field-desc 'flags   'uint 3  'big #:unit 'bits)
+                        (make-field-desc 'frag-off 'uint 13 'big #:unit 'bits))))
+      ;; flags=2 → 010, frag-off=0 → 0000000000000 → 0100_0000_0000_0000 = 0x4000
+      (check-equal? (encode p (hasheq 'flags 2 'frag-off 0))
+                    (bytes #x40 #x00))))
+
+  (context "6+2 bit split"
+    (it "encodes dscp=0, ecn=3 as 0x03"
+      (define p (make-protocol-desc 'test
+                  (list (make-field-desc 'dscp 'uint 6 'big #:unit 'bits)
+                        (make-field-desc 'ecn  'uint 2 'big #:unit 'bits))))
+      ;; dscp=0 → 000000, ecn=3 → 11 → 00000011 = 0x03
+      (check-equal? (encode p (hasheq 'dscp 0 'ecn 3))
+                    (bytes #x03))))
+
+  (context "mixed byte and bitfields"
+    (it "encodes bitfield group followed by byte field"
+      (define p (make-protocol-desc 'test
+                  (list (make-field-desc 'version 'uint 4  'big #:unit 'bits)
+                        (make-field-desc 'ihl     'uint 4  'big #:unit 'bits)
+                        (make-field-desc 'total   'uint 2  'big))))
+      (check-equal? (encode p (hasheq 'version 4 'ihl 5 'total 1500))
+                    (bytes #x45 #x05 #xDC))))
+
+  (context "byte field between two bitfield groups"
+    (it "encodes correctly"
+      (define p (make-protocol-desc 'test
+                  (list (make-field-desc 'a 'uint 4 'big #:unit 'bits)
+                        (make-field-desc 'b 'uint 4 'big #:unit 'bits)
+                        (make-field-desc 'c 'uint 2 'big)
+                        (make-field-desc 'd 'uint 3 'big #:unit 'bits)
+                        (make-field-desc 'e 'uint 13 'big #:unit 'bits))))
+      ;; a=0xF, b=0x0 → 0xF0
+      ;; c=0x0102
+      ;; d=7, e=0 → 111_0000000000000 = 0xE000
+      (check-equal? (encode p (hasheq 'a #xF 'b 0 'c #x0102 'd 7 'e 0))
+                    (bytes #xF0 #x01 #x02 #xE0 #x00)))))
+
+;; ===== Bitfield Decoding =====
+
+(describe "decode (bitfields)"
+  (context "two 4-bit nibbles"
+    (it "decodes 0x45 as version=4, ihl=5"
+      (define p (make-protocol-desc 'test
+                  (list (make-field-desc 'version 'uint 4 'big #:unit 'bits)
+                        (make-field-desc 'ihl     'uint 4 'big #:unit 'bits))))
+      (define v (decode p (bytes #x45)))
+      (check-equal? (hash-ref v 'version) 4)
+      (check-equal? (hash-ref v 'ihl) 5)))
+
+  (context "3+13 bit split"
+    (it "decodes 0x4000 as flags=2, frag-off=0"
+      (define p (make-protocol-desc 'test
+                  (list (make-field-desc 'flags   'uint 3  'big #:unit 'bits)
+                        (make-field-desc 'frag-off 'uint 13 'big #:unit 'bits))))
+      (define v (decode p (bytes #x40 #x00)))
+      (check-equal? (hash-ref v 'flags) 2)
+      (check-equal? (hash-ref v 'frag-off) 0)))
+
+  (context "6+2 bit split"
+    (it "decodes 0x03 as dscp=0, ecn=3"
+      (define p (make-protocol-desc 'test
+                  (list (make-field-desc 'dscp 'uint 6 'big #:unit 'bits)
+                        (make-field-desc 'ecn  'uint 2 'big #:unit 'bits))))
+      (define v (decode p (bytes #x03)))
+      (check-equal? (hash-ref v 'dscp) 0)
+      (check-equal? (hash-ref v 'ecn) 3)))
+
+  (context "mixed byte and bitfields"
+    (it "decodes bitfield group followed by byte field"
+      (define p (make-protocol-desc 'test
+                  (list (make-field-desc 'version 'uint 4  'big #:unit 'bits)
+                        (make-field-desc 'ihl     'uint 4  'big #:unit 'bits)
+                        (make-field-desc 'total   'uint 2  'big))))
+      (define v (decode p (bytes #x45 #x05 #xDC)))
+      (check-equal? (hash-ref v 'version) 4)
+      (check-equal? (hash-ref v 'ihl) 5)
+      (check-equal? (hash-ref v 'total) 1500)))
+
+  (context "round-trip"
+    (it "decode(encode(v)) = v for bitfields"
+      (define p (make-protocol-desc 'test
+                  (list (make-field-desc 'version 'uint 4  'big #:unit 'bits)
+                        (make-field-desc 'ihl     'uint 4  'big #:unit 'bits)
+                        (make-field-desc 'total   'uint 2  'big))))
+      (define v (hasheq 'version 4 'ihl 5 'total 1500))
+      (check-equal? (decode p (encode p v)) v))
+
+    (it "decode(encode(v)) = v for IPv4-like byte 0-1 and 6-7"
+      (define p (make-protocol-desc 'ipv4-partial
+                  (list (make-field-desc 'version 'uint 4  'big #:unit 'bits)
+                        (make-field-desc 'ihl     'uint 4  'big #:unit 'bits)
+                        (make-field-desc 'dscp    'uint 6  'big #:unit 'bits)
+                        (make-field-desc 'ecn     'uint 2  'big #:unit 'bits)
+                        (make-field-desc 'total   'uint 2  'big)
+                        (make-field-desc 'ident   'uint 2  'big)
+                        (make-field-desc 'flags   'uint 3  'big #:unit 'bits)
+                        (make-field-desc 'frag    'uint 13 'big #:unit 'bits))))
+      (define v (hasheq 'version 4 'ihl 5
+                        'dscp 0 'ecn 0
+                        'total 1500
+                        'ident #xABCD
+                        'flags 2 'frag 0))
+      (check-equal? (decode p (encode p v)) v))))
+
+;; ===== Variable-Length Encoding =====
+
+(describe "encode (variable-length)"
+  (context "field-ref width"
+    (it "encodes a variable-length field using referenced field's value"
+      (define p (make-protocol-desc 'pkt
+                  (list (make-field-desc 'len  'uint   2 'big)
+                        (make-field-desc 'data 'octets (make-field-ref 'len) 'big))))
+      (define bs (encode p (hasheq 'len 3 'data (bytes 1 2 3))))
+      ;; 2 bytes for len (big-endian 3) + 3 bytes of data
+      (check-equal? bs (bytes 0 3 1 2 3)))
+
+    (it "validates data length matches the length field"
+      (define p (make-protocol-desc 'pkt
+                  (list (make-field-desc 'len  'uint   2 'big)
+                        (make-field-desc 'data 'octets (make-field-ref 'len) 'big))))
+      (check-exn exn:fail?
+        (λ () (encode p (hasheq 'len 3 'data (bytes 1 2)))))))
+
+  (context "compute width"
+    (it "encodes with a computed width expression"
+      (define p (make-protocol-desc 'msg
+                  (list (make-field-desc 'hdr-len 'uint 1 'big)
+                        (make-field-desc 'payload 'octets
+                                         (make-compute '(- (field-ref hdr-len) 1)
+                                                       (λ (lk) (- (lk 'hdr-len) 1)))
+                                         'big))))
+      ;; hdr-len=5 means payload is 4 bytes
+      (define bs (encode p (hasheq 'hdr-len 5 'payload (bytes 10 20 30 40))))
+      (check-equal? bs (bytes 5 10 20 30 40))))
+
+  (context "mixed fixed and variable fields"
+    (it "encodes fixed fields before and after variable field"
+      (define p (make-protocol-desc 'framed
+                  (list (make-field-desc 'tag  'uint   1 'big)
+                        (make-field-desc 'len  'uint   2 'big)
+                        (make-field-desc 'data 'octets (make-field-ref 'len) 'big)
+                        (make-field-desc 'crc  'uint   2 'big))))
+      (define bs (encode p (hasheq 'tag #xAA 'len 2 'data (bytes #xBB #xCC) 'crc #xDDEE)))
+      (check-equal? bs (bytes #xAA #x00 #x02 #xBB #xCC #xDD #xEE)))))
+
+;; ===== Variable-Length Decoding =====
+
+(describe "decode (variable-length)"
+  (context "field-ref width"
+    (it "decodes a variable-length field"
+      (define p (make-protocol-desc 'pkt
+                  (list (make-field-desc 'len  'uint   2 'big)
+                        (make-field-desc 'data 'octets (make-field-ref 'len) 'big))))
+      (define v (decode p (bytes 0 3 1 2 3)))
+      (check-equal? (hash-ref v 'len) 3)
+      (check-equal? (hash-ref v 'data) (bytes 1 2 3))))
+
+  (context "mixed fixed and variable fields"
+    (it "decodes fields after the variable field correctly"
+      (define p (make-protocol-desc 'framed
+                  (list (make-field-desc 'tag  'uint   1 'big)
+                        (make-field-desc 'len  'uint   2 'big)
+                        (make-field-desc 'data 'octets (make-field-ref 'len) 'big)
+                        (make-field-desc 'crc  'uint   2 'big))))
+      (define v (decode p (bytes #xAA #x00 #x02 #xBB #xCC #xDD #xEE)))
+      (check-equal? (hash-ref v 'tag) #xAA)
+      (check-equal? (hash-ref v 'len) 2)
+      (check-equal? (hash-ref v 'data) (bytes #xBB #xCC))
+      (check-equal? (hash-ref v 'crc) #xDDEE)))
+
+  (context "round-trip"
+    (it "decode(encode(v)) = v for variable-length protocol"
+      (define p (make-protocol-desc 'pkt
+                  (list (make-field-desc 'len  'uint   2 'big)
+                        (make-field-desc 'data 'octets (make-field-ref 'len) 'big))))
+      (define v (hasheq 'len 4 'data (bytes 10 20 30 40)))
+      (check-equal? (decode p (encode p v)) v))
+
+    (it "decode(encode(v)) = v for framed message"
+      (define p (make-protocol-desc 'framed
+                  (list (make-field-desc 'tag  'uint   1 'big)
+                        (make-field-desc 'len  'uint   2 'big)
+                        (make-field-desc 'data 'octets (make-field-ref 'len) 'big)
+                        (make-field-desc 'crc  'uint   2 'big))))
+      (define v (hasheq 'tag #xAA 'len 5 'data (bytes 1 2 3 4 5) 'crc #x1234))
       (check-equal? (decode p (encode p v)) v))))

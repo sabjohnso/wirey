@@ -5,19 +5,135 @@
                      racket/list
                      syntax/parse)
          racket/match
+         racket/list
          wirey/field
          wirey/protocol
-         wirey/codec)
+         wirey/codec
+         wirey/length-expr)
 
 (provide struct/wire)
 
 ;; ============================================================
-;; Helper: build a match expander that dispatches on keyword
-;; field accessors. Called at runtime by the match expander.
+;; Runtime helpers for variable-length struct/wire instances
 ;; ============================================================
 
-;; wire-struct-match-transform : predicate (listof (cons keyword accessor)) stx → stx
-;; Used by generated match expanders to produce match patterns.
+;; Compute field boundaries: returns a vector of (offset . width) pairs.
+;; Used at decode time for protocols with variable-length fields.
+(provide compute-field-boundaries)
+(define (compute-field-boundaries pd data base-offset)
+  (define fields (protocol-desc-fields pd))
+  (define n (length fields))
+  (define boundaries (make-vector n))
+  (let loop ([fs fields] [byte-off base-offset] [bit-acc 0] [i 0] [decoded (hasheq)])
+    (cond
+      [(null? fs) boundaries]
+      [(eq? (field-desc-unit (car fs)) 'bits)
+       ;; Collect bitfield group
+       (define-values (group group-bits remaining)
+         (let grp ([is fs] [g '()] [bits 0])
+           (if (and (pair? is) (eq? (field-desc-unit (car is)) 'bits))
+               (grp (cdr is) (cons (car is) g) (+ bits (field-desc-width (car is))))
+               (values (reverse g) bits is))))
+       (define group-bytes (quotient group-bits 8))
+       ;; Read the group to decode bitfield values (needed for later field-ref lookups)
+       (define raw
+         (for/fold ([acc 0]) ([bi (in-range group-bytes)])
+           (bitwise-ior (arithmetic-shift acc 8)
+                        (bytes-ref data (+ byte-off bi)))))
+       ;; Store boundaries and decode values for each field in group
+       (let gloop ([gs group] [bit-pos 0] [gi i] [dec decoded])
+         (if (null? gs)
+             (loop remaining (+ byte-off group-bytes) 0 gi dec)
+             (let* ([gf (car gs)]
+                    [gw (field-desc-width gf)]
+                    [shift (- group-bits bit-pos gw)]
+                    [val (bitwise-and (arithmetic-shift raw (- shift))
+                                     (sub1 (arithmetic-shift 1 gw)))])
+               ;; Store (group-byte-off group-bytes bit-pos bit-width) for bitfields
+               (vector-set! boundaries gi (list 'bits byte-off group-bytes bit-pos gw))
+               (gloop (cdr gs) (+ bit-pos gw) (+ gi 1)
+                      (hash-set dec (field-desc-name gf) val)))))]
+      [else
+       (define f (car fs))
+       (define w (if (field-desc-variable-length? f)
+                     (eval-length-expr (field-desc-width f)
+                                       (λ (name) (hash-ref decoded name)))
+                     (field-desc-width f)))
+       ;; Decode this field's value for potential use by later field-refs
+       (define val
+         (cond
+           [(eq? (field-desc-type f) 'uint)
+            (decode-uint-simple data byte-off w (field-desc-byte-order f))]
+           [(eq? (field-desc-type f) 'sint)
+            (decode-sint-simple data byte-off w (field-desc-byte-order f))]
+           [else #f]))  ; alpha/octets don't need to be cached for field-ref
+       (vector-set! boundaries i (list 'byte byte-off w))
+       (loop (cdr fs) (+ byte-off w) 0 (+ i 1)
+             (if val (hash-set decoded (field-desc-name f) val) decoded))])))
+
+;; Simple uint decode for boundary computation
+(define (decode-uint-simple data offset width order)
+  (case order
+    [(big)
+     (for/fold ([acc 0]) ([i (in-range width)])
+       (bitwise-ior (arithmetic-shift acc 8)
+                    (bytes-ref data (+ offset i))))]
+    [(little)
+     (for/fold ([acc 0]) ([i (in-range (sub1 width) -1 -1)])
+       (bitwise-ior (arithmetic-shift acc 8)
+                    (bytes-ref data (+ offset i))))]))
+
+(define (decode-sint-simple data offset width order)
+  (define unsigned (decode-uint-simple data offset width order))
+  (define sign-bit (expt 2 (sub1 (* 8 width))))
+  (if (>= unsigned sign-bit)
+      (- unsigned (expt 256 width))
+      unsigned))
+
+;; ============================================================
+;; Match expander helper (compile-time)
+;; ============================================================
+
+;; Translate a width syntax form to a runtime expression.
+;; Recognizes: nat, (field-ref name), (compute source-expr)
+(define-for-syntax (width-stx->expr w-stx)
+  (cond
+    [(nat-stx? w-stx) w-stx]
+    [(and (syntax->list w-stx)
+          (= (length (syntax->list w-stx)) 2)
+          (eq? (syntax-e (car (syntax->list w-stx))) 'field-ref))
+     (define ref-name (cadr (syntax->list w-stx)))
+     #`(make-field-ref '#,ref-name)]
+    [(and (syntax->list w-stx)
+          (>= (length (syntax->list w-stx)) 2)
+          (eq? (syntax-e (car (syntax->list w-stx))) 'compute))
+     (define body (cadr (syntax->list w-stx)))
+     ;; The body is an expression using (field-ref name) forms.
+     ;; We need to build a lambda that takes a lookup function.
+     ;; Replace (field-ref name) with (lk 'name) in the body.
+     (define (transform-compute-body body-stx)
+       (cond
+         [(and (syntax->list body-stx)
+               (= (length (syntax->list body-stx)) 2)
+               (eq? (syntax-e (car (syntax->list body-stx))) 'field-ref))
+          (define ref-name (cadr (syntax->list body-stx)))
+          #`(lk '#,ref-name)]
+         [(syntax->list body-stx)
+          (datum->syntax body-stx
+                         (map transform-compute-body (syntax->list body-stx))
+                         body-stx)]
+         [else body-stx]))
+     (define transformed (transform-compute-body body))
+     #`(make-compute '#,body (λ (lk) #,transformed))]
+    [else
+     (raise-syntax-error 'struct/wire
+                         "invalid width expression: expected nat, (field-ref name), or (compute expr)"
+                         w-stx)]))
+
+(define-for-syntax (nat-stx? stx)
+  (let ([v (syntax-e stx)])
+    (and (integer? v) (exact? v) (>= v 0))))
+
 (define-for-syntax (wire-struct-match-transform pred-id accessor-table pat-stx)
   (syntax-parse pat-stx
     [(_)
@@ -45,25 +161,61 @@
                    #:defaults ([default-bo #'big]))
         field-clause ...)
 
-     ;; Parse field clauses
+     ;; Parse field clauses: (name type width-stx byte-order-or-#f unit-or-#f)
+     ;; width-stx is either a nat literal or a form like (field-ref name)
      (define field-infos
        (for/list ([fc (in-list (syntax->list #'(field-clause ...)))])
          (syntax-parse fc
-           [(fname:id ftype:id fwidth:nat
-                      (~optional (~seq #:byte-order fbo:id)))
-            (list #'fname #'ftype #'fwidth (attribute fbo))])))
+           [(fname:id ftype:id fwidth
+                      (~optional (~seq #:byte-order fbo:id))
+                      (~optional (~seq #:unit funit:id)))
+            (list #'fname #'ftype #'fwidth
+                  (attribute fbo) (attribute funit))])))
 
      (define field-names  (map first field-infos))
      (define field-widths (map third field-infos))
 
-     ;; Compute byte offsets
-     (define field-offsets
-       (let loop ([infos field-infos] [off 0] [acc '()])
-         (if (null? infos)
-             (reverse acc)
-             (loop (cdr infos)
-                   (+ off (syntax-e (third (car infos))))
-                   (cons off acc)))))
+     ;; Determine if a field has a variable-length width (not a literal nat)
+     (define (variable-width? info)
+       (define w (third info))
+       (not (let ([v (syntax-e w)]) (and (integer? v) (exact? v) (>= v 0)))))
+
+     (define has-variable-fields?
+       (ormap variable-width? field-infos))
+
+     (define (bitfield? info)
+       (define u (fifth info))
+       (and u (eq? (syntax-e u) 'bits)))
+
+     ;; Field index for each field
+     (define field-indices (range (length field-infos)))
+
+     ;; Compute static accessor infos (only used when no variable fields)
+     (define static-accessor-infos
+       (if has-variable-fields?
+           #f  ;; will use boundaries at runtime
+           (let loop ([infos field-infos] [byte-off 0] [bit-acc 0] [acc '()])
+             (cond
+               [(null? infos) acc]
+               [(bitfield? (car infos))
+                (define-values (group group-bits remaining)
+                  (let grp ([is infos] [g '()] [bits 0])
+                    (if (and (pair? is) (bitfield? (car is)))
+                        (grp (cdr is) (cons (car is) g) (+ bits (syntax-e (third (car is)))))
+                        (values (reverse g) bits is))))
+                (define group-bytes (quotient group-bits 8))
+                (define group-acc
+                  (let gloop ([gs group] [bit-pos 0] [gacc '()])
+                    (if (null? gs)
+                        (reverse gacc)
+                        (let ([w (syntax-e (third (car gs)))])
+                          (gloop (cdr gs) (+ bit-pos w)
+                                 (cons (list 'bits byte-off group-bytes bit-pos w) gacc))))))
+                (loop remaining (+ byte-off group-bytes) 0 (append acc group-acc))]
+               [else
+                (define w (syntax-e (third (car infos))))
+                (loop (cdr infos) (+ byte-off w) 0
+                      (append acc (list (list 'byte byte-off))))]))))
 
      ;; Keywords from field names
      (define field-kws
@@ -80,6 +232,7 @@
      (define inst-pred   (format-id instance-id "~a?" instance-id))
      (define inst-bytes  (format-id instance-id "~a-bytes" instance-id))
      (define inst-offset (format-id instance-id "~a-offset" instance-id))
+     (define inst-bounds (format-id instance-id "~a-boundaries" instance-id))
      (define desc-id     (generate-temporary #'sname))
      (define pred-id     (format-id #'sname "~a?" #'sname))
      (define encode-id   (format-id #'sname "~a-encode" #'sname))
@@ -89,16 +242,27 @@
        (map (λ (fn) (format-id #'sname "~a-~a" #'sname fn))
             field-names))
 
+     ;; Build width expression for field-desc construction
+     (define (width-expr info)
+       (define w-stx (third info))
+       (if (nat-stx? w-stx)
+           w-stx
+           ;; It's a form like (field-ref name) or (compute ...)
+           w-stx))
+
      ;; Field descriptor expressions
      (define fd-exprs
        (for/list ([info field-infos])
          (define fn (first info))
          (define ft (second info))
-         (define fw (third info))
+         (define fw-stx (third info))
          (define fb (fourth info))
-         (if fb
-             #`(make-field-desc '#,fn '#,ft #,fw '#,fb)
-             #`(make-field-desc '#,fn '#,ft #,fw 'default-bo))))
+         (define fu (fifth info))
+         (define bo-expr (if fb #`'#,fb #`'default-bo))
+         (define width-arg (width-stx->expr fw-stx))
+         (if fu
+             #`(make-field-desc '#,fn '#,ft #,width-arg #,bo-expr #:unit '#,fu)
+             #`(make-field-desc '#,fn '#,ft #,width-arg #,bo-expr))))
 
      ;; Encode function formals (sorted keyword args)
      (define sorted-params
@@ -121,25 +285,65 @@
 
      ;; Accessor definitions
      (define accessor-defs
-       (for/list ([aid accessor-ids]
-                  [fn field-names]
-                  [off field-offsets])
-         #`(define (#,aid v)
-             (decode-field (#,inst-bytes v)
-                           (+ (#,inst-offset v) #,off)
-                           (protocol-desc-field-ref #,desc-id '#,fn)))))
+       (if has-variable-fields?
+           ;; Dynamic accessors using precomputed boundaries
+           (for/list ([aid accessor-ids]
+                      [fn field-names]
+                      [info field-infos]
+                      [idx field-indices])
+             (define ft (second info))
+             #`(define (#,aid v)
+                 (define bounds (vector-ref (#,inst-bounds v) #,idx))
+                 (case (car bounds)
+                   [(byte)
+                    (decode-field (#,inst-bytes v) (second bounds)
+                                 (make-field-desc '#,fn '#,ft (third bounds)
+                                                  (field-desc-byte-order
+                                                   (list-ref (protocol-desc-fields #,desc-id) #,idx))))]
+                   [(bits)
+                    (decode-bitfield (#,inst-bytes v)
+                                    (second bounds) (third bounds)
+                                    (fourth bounds) (fifth bounds)
+                                    '#,ft)])))
+           ;; Static accessors (compile-time offsets)
+           (for/list ([aid accessor-ids]
+                      [fn field-names]
+                      [info field-infos]
+                      [ai static-accessor-infos])
+             (define ft (second info))
+             (case (car ai)
+               [(byte)
+                (define byte-off (second ai))
+                #`(define (#,aid v)
+                    (decode-field (#,inst-bytes v)
+                                  (+ (#,inst-offset v) #,byte-off)
+                                  (protocol-desc-field-ref #,desc-id '#,fn)))]
+               [(bits)
+                (define group-byte-off (second ai))
+                (define group-bytes (third ai))
+                (define bit-offset (fourth ai))
+                (define bit-width (fifth ai))
+                #`(define (#,aid v)
+                    (decode-bitfield (#,inst-bytes v)
+                                     (+ (#,inst-offset v) #,group-byte-off)
+                                     #,group-bytes
+                                     #,bit-offset
+                                     #,bit-width
+                                     '#,ft))]))))
 
-     ;; Accessor table for match expander (keyword-string → accessor-id)
+     ;; Accessor table for match expander
      (define accessor-table-for-match
        (for/list ([fn field-names]
                   [aid accessor-ids])
          (cons (symbol->string (syntax-e fn)) aid)))
 
      #`(begin
-         ;; Instance struct (hidden name)
-         (struct #,instance-id (bytes offset))
+         ;; Instance struct
+         #,(if has-variable-fields?
+               #`(struct #,instance-id (bytes offset boundaries))
+               #`(struct #,instance-id (bytes offset)))
 
-         ;; Protocol descriptor (hidden binding)
+         ;; Protocol descriptor
          (define #,desc-id
            (make-protocol-desc 'sname (list #,@fd-exprs)))
 
@@ -154,12 +358,15 @@
            (encode #,desc-id (hasheq #,@encode-hash-pairs)))
 
          ;; Decode: bytes [#:offset n] → instance
-         (define (#,decode-id data #:offset [offset 0])
-           (#,instance-id data offset))
+         #,(if has-variable-fields?
+               #`(define (#,decode-id data #:offset [offset 0])
+                   (define bounds (compute-field-boundaries #,desc-id data offset))
+                   (#,instance-id data offset bounds))
+               #`(define (#,decode-id data #:offset [offset 0])
+                   (#,instance-id data offset)))
 
          ;; Match expander + expression transformer
          (define-match-expander sname
-           ;; Match transformer
            (λ (pat-stx)
              (wire-struct-match-transform
               #'#,pred-id
@@ -168,5 +375,4 @@
                         (for/list ([entry accessor-table-for-match])
                           (list (car entry) #`#'#,(cdr entry)))))
               pat-stx))
-           ;; Expression transformer — evaluates to protocol descriptor
            (λ (expr-stx) #'#,desc-id)))]))

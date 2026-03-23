@@ -1,11 +1,23 @@
 #lang racket/base
 
 (require wirey/field
-         wirey/protocol)
+         wirey/protocol
+         wirey/length-expr)
 
 (provide encode
          decode
-         decode-field)
+         decode-field
+         decode-bitfield)
+
+;; ============================================================
+;; Resolve a field's width to an integer, given values hash
+;; ============================================================
+
+(define (resolve-width fd values)
+  (define w (field-desc-width fd))
+  (if (exact-positive-integer? w)
+      w
+      (eval-length-expr w (λ (name) (hash-ref values name)))))
 
 ;; ============================================================
 ;; Encoding: protocol-desc + hash → bytes
@@ -13,21 +25,70 @@
 
 (define (encode pd values)
   (define fields (protocol-desc-fields pd))
-  (define total (protocol-desc-total-size pd))
+  ;; Compute total size by resolving all widths
+  (define total
+    (let loop ([fields fields] [bit-acc 0] [total 0])
+      (cond
+        [(null? fields)
+         (+ total (quotient bit-acc 8))]
+        [(eq? (field-desc-unit (car fields)) 'bits)
+         (loop (cdr fields) (+ bit-acc (field-desc-width (car fields))) total)]
+        [else
+         (define flush (if (zero? bit-acc) 0 (quotient bit-acc 8)))
+         (define w (resolve-width (car fields) values))
+         (loop (cdr fields) 0 (+ total flush w))])))
   (define buf (make-bytes total 0))
-  (let loop ([fields fields] [offset 0])
-    (unless (null? fields)
-      (define f (car fields))
-      (define name (field-desc-name f))
-      (define width (field-desc-width f))
-      (define val (hash-ref values name))
-      (encode-field! buf offset f val)
-      (loop (cdr fields) (+ offset width))))
+  (let loop ([fields fields] [byte-off 0] [bit-acc 0] [bit-count 0])
+    (cond
+      [(null? fields)
+       (when (> bit-count 0)
+         (flush-bits! buf byte-off bit-acc bit-count))
+       buf]
+      [(eq? (field-desc-unit (car fields)) 'bits)
+       (define f (car fields))
+       (define val (hash-ref values (field-desc-name f)))
+       (define w (field-desc-width f))
+       (define new-acc (bitwise-ior (arithmetic-shift bit-acc w)
+                                    (bitwise-and val (sub1 (arithmetic-shift 1 w)))))
+       (define new-count (+ bit-count w))
+       (cond
+         [(zero? (remainder new-count 8))
+          (flush-bits! buf byte-off new-acc new-count)
+          (loop (cdr fields) (+ byte-off (quotient new-count 8)) 0 0)]
+         [else
+          (loop (cdr fields) byte-off new-acc new-count)])]
+      [else
+       (define flush-bytes
+         (if (> bit-count 0)
+             (begin (flush-bits! buf byte-off bit-acc bit-count)
+                    (quotient bit-count 8))
+             0))
+       (define f (car fields))
+       (define off (+ byte-off flush-bytes))
+       (define w (resolve-width f values))
+       ;; Validate variable-length data consistency
+       (when (field-desc-variable-length? f)
+         (define val (hash-ref values (field-desc-name f)))
+         (when (bytes? val)
+           (unless (= (bytes-length val) w)
+             (error 'encode
+                    "field '~a': length expression evaluates to ~a but data is ~a bytes"
+                    (field-desc-name f) w (bytes-length val)))))
+       (encode-field! buf off f w (hash-ref values (field-desc-name f)))
+       (loop (cdr fields) (+ off w) 0 0)]))
   buf)
 
-(define (encode-field! buf offset fd val)
+;; Write accumulated bits to buffer as big-endian bytes
+(define (flush-bits! buf byte-off acc bit-count)
+  (define byte-count (quotient bit-count 8))
+  (for ([i (in-range byte-count)])
+    (bytes-set! buf (+ byte-off i)
+                (bitwise-and
+                 (arithmetic-shift acc (* -8 (- byte-count 1 i)))
+                 #xFF))))
+
+(define (encode-field! buf offset fd width val)
   (define type (field-desc-type fd))
-  (define width (field-desc-width fd))
   (define order (field-desc-byte-order fd))
   (case type
     [(uint)   (encode-uint! buf offset width order val)]
@@ -56,7 +117,6 @@
   (define src (string->bytes/latin-1 val))
   (define len (min (bytes-length src) width))
   (bytes-copy! buf offset src 0 len)
-  ;; pad with spaces
   (for ([i (in-range len width)])
     (bytes-set! buf (+ offset i) (char->integer #\space))))
 
@@ -69,26 +129,84 @@
 
 (define (decode pd data #:offset [start 0])
   (define fields (protocol-desc-fields pd))
-  (let loop ([fields fields] [offset start] [result (hasheq)])
-    (if (null? fields)
-        result
-        (let* ([f (car fields)]
-               [width (field-desc-width f)]
-               [name (field-desc-name f)]
-               [val (decode-field data offset f)])
-          (loop (cdr fields)
-                (+ offset width)
-                (hash-set result name val))))))
+  (let loop ([fields fields] [byte-off start] [bit-off 0] [result (hasheq)])
+    (cond
+      [(null? fields)
+       result]
+      [(eq? (field-desc-unit (car fields)) 'bits)
+       (define-values (group-fields group-bits remaining)
+         (collect-bitfield-group fields))
+       (define group-bytes (quotient group-bits 8))
+       (define raw
+         (for/fold ([acc 0]) ([i (in-range group-bytes)])
+           (bitwise-ior (arithmetic-shift acc 8)
+                        (bytes-ref data (+ byte-off i)))))
+       (define new-result
+         (let extract ([fs group-fields] [bits-remaining group-bits] [res result])
+           (if (null? fs)
+               res
+               (let* ([gf (car fs)]
+                      [gw (field-desc-width gf)]
+                      [shift (- bits-remaining gw)]
+                      [val (bitwise-and (arithmetic-shift raw (- shift))
+                                        (sub1 (arithmetic-shift 1 gw)))]
+                      [final-val (if (eq? (field-desc-type gf) 'sint)
+                                     (sint-from-bits val gw)
+                                     val)])
+                 (extract (cdr fs) shift
+                          (hash-set res (field-desc-name gf) final-val))))))
+       (loop remaining (+ byte-off group-bytes) 0 new-result)]
+      [else
+       (define f (car fields))
+       (define w (if (field-desc-variable-length? f)
+                     (eval-length-expr (field-desc-width f)
+                                       (λ (name) (hash-ref result name)))
+                     (field-desc-width f)))
+       (define val (decode-field-with-width data byte-off f w))
+       (loop (cdr fields) (+ byte-off w) 0
+             (hash-set result (field-desc-name f) val))])))
 
-(define (decode-field data offset fd)
+;; Collect contiguous bit-unit fields
+(define (collect-bitfield-group fields)
+  (let loop ([fs fields] [group '()] [bits 0])
+    (if (and (pair? fs) (eq? (field-desc-unit (car fs)) 'bits))
+        (loop (cdr fs) (cons (car fs) group)
+              (+ bits (field-desc-width (car fs))))
+        (values (reverse group) bits fs))))
+
+(define (sint-from-bits val bit-width)
+  (define sign-bit (arithmetic-shift 1 (sub1 bit-width)))
+  (if (>= val sign-bit)
+      (- val (arithmetic-shift 1 bit-width))
+      val))
+
+;; Decode a single field with an explicit width (for variable-length support)
+(define (decode-field-with-width data offset fd width)
   (define type (field-desc-type fd))
-  (define width (field-desc-width fd))
   (define order (field-desc-byte-order fd))
   (case type
     [(uint)   (decode-uint data offset width order)]
     [(sint)   (decode-sint data offset width order)]
     [(alpha)  (decode-alpha data offset width)]
     [(octets) (decode-octets data offset width)]))
+
+;; Decode a single field using its own width (byte-unit, fixed-width only)
+(define (decode-field data offset fd)
+  (decode-field-with-width data offset fd (field-desc-width fd)))
+
+;; Decode a single bitfield from a byte span
+(define (decode-bitfield data group-byte-off group-bytes bit-offset bit-width type)
+  (define raw
+    (for/fold ([acc 0]) ([i (in-range group-bytes)])
+      (bitwise-ior (arithmetic-shift acc 8)
+                   (bytes-ref data (+ group-byte-off i)))))
+  (define total-bits (* 8 group-bytes))
+  (define shift (- total-bits bit-offset bit-width))
+  (define val (bitwise-and (arithmetic-shift raw (- shift))
+                           (sub1 (arithmetic-shift 1 bit-width))))
+  (if (eq? type 'sint)
+      (sint-from-bits val bit-width)
+      val))
 
 (define (decode-uint data offset width order)
   (case order
@@ -115,6 +233,5 @@
 (define (decode-octets data offset width)
   (subbytes data offset (+ offset width)))
 
-;; string-trim-right: remove trailing spaces
 (define (string-trim-right s)
   (regexp-replace #rx" +$" s ""))

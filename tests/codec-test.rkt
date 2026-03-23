@@ -568,6 +568,41 @@
     (define v (hasheq 'name "Test"))
     (check-equal? (hash-ref (decode p (encode p v)) 'name) "Test")))
 
+(describe "encode/decode utf32"
+  (it "encodes big-endian UTF-32"
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'name 'utf32 12 'big))))
+    ;; "AB" = 0x00000041 0x00000042 in UTF-32BE, then null-padded
+    (define bs (encode p (hasheq 'name "AB")))
+    (check-equal? (subbytes bs 0 8)
+                  (bytes #x00 #x00 #x00 #x41 #x00 #x00 #x00 #x42)))
+
+  (it "round-trips"
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'name 'utf32 16 'big))))
+    (define v (hasheq 'name "Test"))
+    (check-equal? (hash-ref (decode p (encode p v)) 'name) "Test")))
+
+(describe "encode/decode with #:terminator"
+  (it "encodes null-terminated alpha string"
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'name 'alpha 8 'big #:terminator 0))))
+    (define bs (encode p (hasheq 'name "hello")))
+    ;; "hello" + null + padding zeros
+    (check-equal? (bytes-ref bs 5) 0)
+    (check-equal? (bytes-length bs) 8))
+
+  (it "decodes up to null terminator"
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'name 'alpha 8 'big #:terminator 0))))
+    (define bs (bytes-append #"hello" (bytes 0 0 0)))
+    (check-equal? (hash-ref (decode p bs) 'name) "hello"))
+
+  (it "decodes full-width string with no null"
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'name 'alpha 5 'big #:terminator 0))))
+    (check-equal? (hash-ref (decode p #"hello") 'name) "hello")))
+
 ;; ===== New Field Types =====
 
 (describe "encode/decode float32"
@@ -645,6 +680,45 @@
                 (list (make-field-desc 'val 'bcd 2 'big))))
     ;; 42 → 00 42
     (check-equal? (encode p (hasheq 'val 42)) (bytes #x00 #x42))))
+
+;; ===== Repetition / Arrays =====
+
+(describe "encode/decode repeat (fixed count)"
+  (it "encodes a fixed array of uint16"
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'vals 'uint 2 'big #:repeat 3))))
+    (define bs (encode p (hasheq 'vals (list #x0001 #x0002 #x0003))))
+    (check-equal? bs (bytes #x00 #x01 #x00 #x02 #x00 #x03)))
+
+  (it "decodes a fixed array of uint16"
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'vals 'uint 2 'big #:repeat 3))))
+    (define v (decode p (bytes #x00 #x01 #x00 #x02 #x00 #x03)))
+    (check-equal? (hash-ref v 'vals) (list #x0001 #x0002 #x0003)))
+
+  (it "round-trips"
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'vals 'uint 4 'big #:repeat 2))))
+    (define v (hasheq 'vals (list #xDEADBEEF #xCAFEBABE)))
+    (check-equal? (decode p (encode p v)) v)))
+
+(describe "encode/decode repeat (count from field)"
+  (it "encodes with count-prefixed array"
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'count 'uint 1 'big)
+                      (make-field-desc 'items 'uint 2 'big
+                                       #:repeat (make-field-ref 'count)))))
+    (define bs (encode p (hasheq 'count 2 'items (list #x000A #x000B))))
+    (check-equal? bs (bytes 2 #x00 #x0A #x00 #x0B)))
+
+  (it "decodes with count-prefixed array"
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'count 'uint 1 'big)
+                      (make-field-desc 'items 'uint 2 'big
+                                       #:repeat (make-field-ref 'count)))))
+    (define v (decode p (bytes 3 #x00 #x01 #x00 #x02 #x00 #x03)))
+    (check-equal? (hash-ref v 'count) 3)
+    (check-equal? (hash-ref v 'items) (list 1 2 3))))
 
 ;; ===== Padding and Alignment =====
 

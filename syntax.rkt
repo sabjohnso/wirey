@@ -9,7 +9,8 @@
          wirey/field
          wirey/protocol
          wirey/codec
-         wirey/length-expr)
+         wirey/length-expr
+         wirey/enum)
 
 (provide struct/wire)
 
@@ -175,6 +176,8 @@
                    #:defaults ([default-bo #'big]))
         (~optional (~seq #:bit-order default-bito:id)
                    #:defaults ([default-bito #f]))
+        (~optional (~seq #:alignment default-align:nat)
+                   #:defaults ([default-align #f]))
         field-clause ...)
 
      ;; Parse field clauses: 9-element list
@@ -187,7 +190,7 @@
            [(fname:id ftype:id #:align falign:nat)
             #:when (eq? (syntax-e #'ftype) 'padding)
             (list #'fname #'ftype #f
-                  #f #f #f #f #f (syntax-e #'falign) #f #f)]
+                  #f #f #f #f #f (syntax-e #'falign) #f #f #f)]
            ;; Normal field clause
            [(fname:id ftype:id fwidth
                       (~optional (~seq #:byte-order fbo:id))
@@ -196,16 +199,41 @@
                       (~optional (~seq #:compute fcompute:expr))
                       (~optional (~seq #:contract fcontract:expr))
                       (~optional (~seq #:present-when fpresent:expr))
-                      (~optional (~seq #:default fdefault:expr)))
+                      (~optional (~seq #:default fdefault:expr))
+                      (~optional (~seq #:enum fenum:expr)))
             (list #'fname #'ftype #'fwidth
                   (attribute fbo) (attribute funit) (attribute fbito)
                   (attribute fcompute) (attribute fcontract) #f
-                  (attribute fpresent) (attribute fdefault))])))
+                  (attribute fpresent) (attribute fdefault)
+                  (attribute fenum))])))
+
+     ;; If #:alignment is set, insert auto-alignment padding before each
+     ;; non-first, non-padding field.
+     (define align-injected-infos
+       (if (attribute default-align)
+           (let ([align-n (syntax-e #'default-align)])
+             (let loop ([infos raw-field-infos] [first? #t] [acc '()])
+               (cond
+                 [(null? infos) (reverse acc)]
+                 [(and (not first?)
+                       (not (eq? (syntax-e (second (car infos))) 'padding)))
+                  ;; Insert an auto-align padding entry before this field
+                  (define pad-name (datum->syntax (first (car infos))
+                                                  (string->symbol
+                                                   (format "__align_~a" (length acc)))))
+                  (define pad-info
+                    (list pad-name
+                          (datum->syntax #f 'padding)
+                          #f #f #f #f #f #f align-n #f #f #f))
+                  (loop (cdr infos) #f (cons (car infos) (cons pad-info acc)))]
+                 [else
+                  (loop (cdr infos) #f (cons (car infos) acc))])))
+           raw-field-infos))
 
      ;; Resolve #:align padding widths based on static offsets.
      ;; Walks fields, tracks byte offset, computes padding for #:align fields.
      (define field-infos
-       (let loop ([infos raw-field-infos] [byte-off 0] [bit-acc 0] [acc '()])
+       (let loop ([infos align-injected-infos] [byte-off 0] [bit-acc 0] [acc '()])
          (cond
            [(null? infos)
             (reverse acc)]
@@ -224,7 +252,7 @@
                 (let ([new-info (list (first info)
                                      (second info)
                                      (datum->syntax (first info) pad-width)
-                                     #f #f #f #f #f #f #f #f)])
+                                     #f #f #f #f #f #f #f #f #f)])
                   (loop (cdr infos) (+ cur-off pad-width) 0 (cons new-info acc))))]
            ;; Bitfield: accumulate bits
            [(and (fifth (car infos))
@@ -409,7 +437,18 @@
               (for/list ([i encode-sorted-idxs]
                          [param encode-sorted-params])
                 (define fn (list-ref field-names i))
-                (list #`'#,fn param))))
+                (define info (list-ref field-infos i))
+                (define fenum (list-ref info 11))
+                (if fenum
+                    (list #`'#,fn #`(wire-enum-ref #,fenum #,param))
+                    (list #`'#,fn param)))))
+
+     ;; Helper: wrap an accessor body expr with enum lookup if needed
+     (define (maybe-wrap-enum info body-expr)
+       (define fenum (list-ref info 11))
+       (if fenum
+           #`(wire-enum-lookup #,fenum #,body-expr)
+           body-expr))
 
      ;; Accessor definitions (skip padding fields)
      (define accessor-defs
@@ -423,19 +462,21 @@
              (define ft (second info))
              #`(define (#,aid v)
                  (define bounds (vector-ref (#,inst-bounds v) #,idx))
-                 (case (car bounds)
-                   [(absent) #f]
-                   [(byte)
-                    (decode-field (#,inst-bytes v) (second bounds)
-                                 (make-field-desc '#,fn '#,ft (third bounds)
-                                                  (field-desc-byte-order
-                                                   (list-ref (protocol-desc-fields #,desc-id) #,idx))))]
-                   [(bits)
-                    (decode-bitfield (#,inst-bytes v)
-                                    (second bounds) (third bounds)
-                                    (fourth bounds) (fifth bounds)
-                                    '#,ft
-                                    #:bit-order (sixth bounds))])))
+                 (define raw-val
+                   (case (car bounds)
+                     [(absent) #f]
+                     [(byte)
+                      (decode-field (#,inst-bytes v) (second bounds)
+                                   (make-field-desc '#,fn '#,ft (third bounds)
+                                                    (field-desc-byte-order
+                                                     (list-ref (protocol-desc-fields #,desc-id) #,idx))))]
+                     [(bits)
+                      (decode-bitfield (#,inst-bytes v)
+                                      (second bounds) (third bounds)
+                                      (fourth bounds) (fifth bounds)
+                                      '#,ft
+                                      #:bit-order (sixth bounds))]))
+                 #,(maybe-wrap-enum info #'raw-val)))
            ;; Static accessors (compile-time offsets)
            (for/list ([aid accessor-ids]
                       [fn field-names]
@@ -447,9 +488,11 @@
                [(byte)
                 (define byte-off (second ai))
                 #`(define (#,aid v)
-                    (decode-field (#,inst-bytes v)
-                                  (+ (#,inst-offset v) #,byte-off)
-                                  (protocol-desc-field-ref #,desc-id '#,fn)))]
+                    (define raw-val
+                      (decode-field (#,inst-bytes v)
+                                    (+ (#,inst-offset v) #,byte-off)
+                                    (protocol-desc-field-ref #,desc-id '#,fn)))
+                    #,(maybe-wrap-enum info #'raw-val))]
                [(bits)
                 (define group-byte-off (second ai))
                 (define group-bytes (third ai))
@@ -457,13 +500,15 @@
                 (define bit-width (fifth ai))
                 (define bit-ord (sixth ai))
                 #`(define (#,aid v)
-                    (decode-bitfield (#,inst-bytes v)
-                                     (+ (#,inst-offset v) #,group-byte-off)
-                                     #,group-bytes
-                                     #,bit-offset
-                                     #,bit-width
-                                     '#,ft
-                                     #:bit-order '#,(datum->syntax #'sname bit-ord)))]))))
+                    (define raw-val
+                      (decode-bitfield (#,inst-bytes v)
+                                       (+ (#,inst-offset v) #,group-byte-off)
+                                       #,group-bytes
+                                       #,bit-offset
+                                       #,bit-width
+                                       '#,ft
+                                       #:bit-order '#,(datum->syntax #'sname bit-ord)))
+                    #,(maybe-wrap-enum info #'raw-val))]))))
 
      ;; Accessor table for match expander (skip padding)
      (define accessor-table-for-match

@@ -20,13 +20,16 @@
          field-desc-has-contract?
          field-desc-present-when
          field-desc-conditional?
+         field-desc-terminator
+         field-desc-repeat
+         field-desc-repeated?
          field-desc-width-in-bits
          field-desc-variable-length?)
 
 ;; Valid field types
 (define (field-type? v)
   (and (symbol? v)
-       (memq v '(uint sint alpha octets padding float32 float64 bcd bool utf8 utf16))
+       (memq v '(uint sint alpha octets padding float32 float64 bcd bool utf8 utf16 utf32))
        #t))
 
 ;; Valid byte orderings
@@ -51,8 +54,8 @@
 (define (bitfield-type? v)
   (memq v '(uint sint)))
 
-;; Internal struct — 9 fields
-(struct field-desc (name type width byte-order unit bit-order compute contract present-when)
+;; Internal struct — 11 fields
+(struct field-desc (name type width byte-order unit bit-order compute contract present-when terminator repeat)
   #:transparent)
 
 ;; Validated constructor
@@ -61,7 +64,9 @@
                          #:bit-order [bit-ord #f]
                          #:compute [compute-fn #f]
                          #:contract [contract-fn #f]
-                         #:present-when [present-when-fn #f])
+                         #:present-when [present-when-fn #f]
+                         #:terminator [terminator #f]
+                         #:repeat [repeat-count #f])
   (unless (symbol? name)
     (error 'make-field-desc "name must be a symbol, got: ~e" name))
   (unless (field-type? type)
@@ -91,7 +96,11 @@
     (error 'make-field-desc "#:contract must be a procedure, got: ~e" contract-fn))
   (when (and present-when-fn (not (procedure? present-when-fn)))
     (error 'make-field-desc "#:present-when must be a procedure, got: ~e" present-when-fn))
-  (field-desc name type width byte-order unit bit-ord compute-fn contract-fn present-when-fn))
+  (field-desc name type width byte-order unit bit-ord compute-fn contract-fn present-when-fn terminator repeat-count))
+
+;; Is this a repeated (array) field?
+(define (field-desc-repeated? fd)
+  (and (field-desc-repeat fd) #t))
 
 ;; Is this a computed field?
 (define (field-desc-computed? fd)

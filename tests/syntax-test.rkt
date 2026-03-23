@@ -7,7 +7,8 @@
          wirey/protocol
          wirey/syntax
          wirey/length-expr
-         wirey/checksum)
+         wirey/checksum
+         wirey/enum)
 
 ;; -- helpers --
 (define (hex->bytes str)
@@ -441,6 +442,34 @@
     (check-equal? (conditional-msg-opt v) #f)
     (check-equal? (conditional-msg-tail v) #xFF)))
 
+;; Test #:enum in struct/wire
+(define-wire-enum test-protocol
+  [tcp  6]
+  [udp  17])
+
+(struct/wire enum-msg
+  #:byte-order big
+  (proto uint 1 #:enum test-protocol)
+  (data  uint 2))
+
+(describe "struct/wire with #:enum"
+  (it "accepts enum symbols on encode"
+    (define bs (enum-msg-encode #:proto 'tcp #:data #x1234))
+    (check-equal? (bytes-ref bs 0) 6))
+
+  (it "accepts raw integers on encode"
+    (define bs (enum-msg-encode #:proto 6 #:data #x1234))
+    (check-equal? (bytes-ref bs 0) 6))
+
+  (it "returns enum symbols on decode"
+    (define v (enum-msg-decode (bytes 6 #x12 #x34)))
+    (check-equal? (enum-msg-proto v) 'tcp)
+    (check-equal? (enum-msg-data v) #x1234))
+
+  (it "returns raw integers for unknown enum values"
+    (define v (enum-msg-decode (bytes 99 #x00 #x00)))
+    (check-equal? (enum-msg-proto v) 99)))
+
 ;; Test padding in struct/wire
 (struct/wire padded-msg
   #:byte-order big
@@ -505,3 +534,36 @@
     (check-equal? (aligned-msg-value v) #x01020304)
     (check-equal? (aligned-msg-short v) #x0506)
     (check-equal? (aligned-msg-data v) #x0708090A)))
+
+;; Test protocol-level #:alignment
+(struct/wire auto-aligned-msg
+  #:byte-order big
+  #:alignment 4
+  (tag   uint 1)
+  (value uint 4)
+  (short uint 2)
+  (data  uint 4))
+
+(describe "struct/wire with #:alignment"
+  (it "auto-inserts padding to align each field"
+    ;; tag at 0 (1 byte), pad 3 → value at 4 (4 bytes),
+    ;; short at 8 (2 bytes), pad 2 → data at 12 (4 bytes)
+    ;; total = 16
+    (define bs (auto-aligned-msg-encode #:tag #xAA #:value #x01020304
+                                        #:short #x0506 #:data #x0708090A))
+    (check-equal? (bytes-length bs) 16)
+    (check-equal? (bytes-ref bs 0) #xAA)
+    (check-equal? (subbytes bs 4 8) (bytes #x01 #x02 #x03 #x04))
+    (check-equal? (subbytes bs 8 10) (bytes #x05 #x06))
+    (check-equal? (subbytes bs 12 16) (bytes #x07 #x08 #x09 #x0A)))
+
+  (it "decodes correctly"
+    (define bs (bytes #xAA 0 0 0
+                      #x01 #x02 #x03 #x04
+                      #x05 #x06 0 0
+                      #x07 #x08 #x09 #x0A))
+    (define v (auto-aligned-msg-decode bs))
+    (check-equal? (auto-aligned-msg-tag v) #xAA)
+    (check-equal? (auto-aligned-msg-value v) #x01020304)
+    (check-equal? (auto-aligned-msg-short v) #x0506)
+    (check-equal? (auto-aligned-msg-data v) #x0708090A)))

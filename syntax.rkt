@@ -141,9 +141,8 @@
      (define transformed (transform-compute-body body))
      #`(make-compute '#,body (λ (lk) #,transformed))]
     [else
-     (raise-syntax-error 'struct/wire
-                         "invalid width expression: expected nat, (field-ref name), or (compute expr)"
-                         w-stx)]))
+     ;; Pass through as a runtime expression (e.g., protocol-desc-total-size call)
+     w-stx]))
 
 (define-for-syntax (nat-stx? stx)
   (let ([v (syntax-e stx)])
@@ -191,6 +190,13 @@
             #:when (eq? (syntax-e #'ftype) 'padding)
             (list #'fname #'ftype #f
                   #f #f #f #f #f (syntax-e #'falign) #f #f #f)]
+           ;; Embedded struct field
+           [(fname:id fstruct:id #:struct)
+            ;; Store the struct name in a special marker.
+            ;; Width will be resolved later. Type is 'octets at codec level.
+            ;; We use a list marker ('embedded struct-name) in the type position.
+            (list #'fname (list 'embedded #'fstruct) #f
+                  #f #f #f #f #f #f #f #f #f)]
            ;; Normal field clause
            [(fname:id ftype:id fwidth
                       (~optional (~seq #:byte-order fbo:id))
@@ -263,6 +269,21 @@
             (if (zero? (modulo new-bits 8))
                 (loop (cdr infos) (+ byte-off (quotient new-bits 8)) 0 (cons info acc))
                 (loop (cdr infos) byte-off new-bits (cons info acc)))]
+           ;; Embedded struct: convert to octets with runtime width
+           [(and (pair? (second (car infos)))
+                 (eq? (car (second (car infos))) 'embedded))
+            (define info (car infos))
+            (define struct-name-stx (cadr (second info)))
+            ;; Create a resolved info: type = octets, width computed at runtime
+            ;; Store the struct name for accessor generation
+            (define resolved-info
+              (list (first info)
+                    (datum->syntax #f 'octets)   ;; codec type
+                    ;; Width: use (protocol-desc-total-size struct-name) at runtime
+                    #`(protocol-desc-total-size #,struct-name-stx)
+                    #f #f #f #f #f #f #f #f
+                    (list 'embedded-struct struct-name-stx)))
+            (loop (cdr infos) byte-off bit-acc (cons resolved-info acc))]
            ;; Normal byte field
            [else
             (define info (car infos))
@@ -439,16 +460,39 @@
                 (define fn (list-ref field-names i))
                 (define info (list-ref field-infos i))
                 (define fenum (list-ref info 11))
-                (if fenum
+                (if (and fenum (not (pair? fenum)))  ;; skip embedded-struct markers
                     (list #`'#,fn #`(wire-enum-ref #,fenum #,param))
                     (list #`'#,fn param)))))
+
+     ;; Helper: is this an embedded struct field?
+     (define (field-embedded-struct? info)
+       (define v (list-ref info 11))
+       (and (pair? v) (eq? (car v) 'embedded-struct)))
+
+     (define (field-embedded-struct-name info)
+       (cadr (list-ref info 11)))
 
      ;; Helper: wrap an accessor body expr with enum lookup if needed
      (define (maybe-wrap-enum info body-expr)
        (define fenum (list-ref info 11))
-       (if fenum
+       (if (and fenum (not (pair? fenum)))  ;; not an embedded-struct marker
            #`(wire-enum-lookup #,fenum #,body-expr)
            body-expr))
+
+     ;; Helper: wrap accessor for embedded struct (decode bytes as inner struct)
+     (define (maybe-wrap-embedded info body-expr)
+       (if (field-embedded-struct? info)
+           (let ([struct-name (field-embedded-struct-name info)])
+             (define decode-fn (format-id struct-name "~a-decode" struct-name))
+             #`(let ([raw #,body-expr])
+                 (if (bytes? raw)
+                     (#,decode-fn raw)
+                     raw)))
+           body-expr))
+
+     ;; Combined accessor wrapper
+     (define (wrap-accessor info body-expr)
+       (maybe-wrap-enum info (maybe-wrap-embedded info body-expr)))
 
      ;; Accessor definitions (skip padding fields)
      (define accessor-defs
@@ -476,7 +520,7 @@
                                       (fourth bounds) (fifth bounds)
                                       '#,ft
                                       #:bit-order (sixth bounds))]))
-                 #,(maybe-wrap-enum info #'raw-val)))
+                 #,(wrap-accessor info #'raw-val)))
            ;; Static accessors (compile-time offsets)
            (for/list ([aid accessor-ids]
                       [fn field-names]
@@ -492,7 +536,7 @@
                       (decode-field (#,inst-bytes v)
                                     (+ (#,inst-offset v) #,byte-off)
                                     (protocol-desc-field-ref #,desc-id '#,fn)))
-                    #,(maybe-wrap-enum info #'raw-val))]
+                    #,(wrap-accessor info #'raw-val))]
                [(bits)
                 (define group-byte-off (second ai))
                 (define group-bytes (third ai))
@@ -508,7 +552,7 @@
                                        #,bit-width
                                        '#,ft
                                        #:bit-order '#,(datum->syntax #'sname bit-ord)))
-                    #,(maybe-wrap-enum info #'raw-val))]))))
+                    #,(wrap-accessor info #'raw-val))]))))
 
      ;; Accessor table for match expander (skip padding)
      (define accessor-table-for-match

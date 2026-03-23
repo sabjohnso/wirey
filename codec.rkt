@@ -68,7 +68,11 @@
          (define f (car fields))
          (define w (resolve-width f effective-values))
          (define rep (field-desc-repeat f))
+         (define rep-until (field-desc-repeat-until f))
          (define count (cond
+                         [rep-until
+                          ;; Items + 1 for sentinel
+                          (+ 1 (length (hash-ref effective-values (field-desc-name f))))]
                          [(not rep) 1]
                          [(exact-positive-integer? rep) rep]
                          [else (eval-length-expr rep (λ (name) (hash-ref effective-values name)))]))
@@ -96,7 +100,17 @@
        (define w (resolve-width f effective-values))
        (cond
          ;; Repeated field: encode each element
-         [(field-desc-repeated? f)
+         [(field-desc-repeat-until f)
+          ;; Encode all elements + sentinel (zero value of the field width)
+          (define vals (hash-ref effective-values (field-desc-name f)))
+          (let rep-loop ([items vals] [off byte-off])
+            (if (null? items)
+                ;; Write sentinel (buffer is pre-zeroed, just advance)
+                (loop (cdr fields) (+ off w))
+                (begin
+                  (encode-field! buf off f w (car items))
+                  (rep-loop (cdr items) (+ off w)))))]
+         [(field-desc-repeat f)
           (define rep (field-desc-repeat f))
           (define count (if (exact-positive-integer? rep)
                             rep
@@ -316,7 +330,18 @@
          [(eq? (field-desc-type f) 'padding)
           ;; Skip padding
           (loop (cdr fields) (+ byte-off w) 0 result)]
-         [(field-desc-repeated? f)
+         [(field-desc-repeat-until f)
+          ;; Decode elements until predicate returns true
+          (define pred (field-desc-repeat-until f))
+          (define-values (items end-off)
+            (let rep-loop ([off byte-off] [acc '()])
+              (define val (decode-field-with-width data off f w))
+              (if (pred val)
+                  (values (reverse acc) (+ off w))  ;; consume sentinel
+                  (rep-loop (+ off w) (cons val acc)))))
+          (loop (cdr fields) end-off 0
+                (hash-set result (field-desc-name f) items))]
+         [(field-desc-repeat f)
           ;; Decode N elements into a list
           (define rep (field-desc-repeat f))
           (define count (if (exact-positive-integer? rep)

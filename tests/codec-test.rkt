@@ -720,6 +720,33 @@
     (check-equal? (hash-ref v 'count) 3)
     (check-equal? (hash-ref v 'items) (list 1 2 3))))
 
+(describe "encode/decode repeat-until"
+  (it "encodes elements followed by a sentinel"
+    (define (sentinel? v) (= v 0))
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'items 'uint 2 'big
+                                       #:repeat-until sentinel?))))
+    (define bs (encode p (hasheq 'items (list #x0001 #x0002 #x0003))))
+    ;; Encodes the items followed by a 0x0000 sentinel
+    (check-equal? bs (bytes #x00 #x01 #x00 #x02 #x00 #x03 #x00 #x00)))
+
+  (it "decodes until sentinel is found"
+    (define (sentinel? v) (= v 0))
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'items 'uint 2 'big
+                                       #:repeat-until sentinel?))))
+    (define v (decode p (bytes #x00 #x01 #x00 #x02 #x00 #x00 #xFF #xFF)))
+    (check-equal? (hash-ref v 'items) (list 1 2)))
+
+  (it "handles fields after repeat-until"
+    (define (sentinel? v) (= v 0))
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'items 'uint 1 'big #:repeat-until sentinel?)
+                      (make-field-desc 'tail  'uint 1 'big))))
+    (define v (decode p (bytes 1 2 3 0 #xFF)))
+    (check-equal? (hash-ref v 'items) (list 1 2 3))
+    (check-equal? (hash-ref v 'tail) #xFF)))
+
 ;; ===== Padding and Alignment =====
 
 (describe "encode (padding)"

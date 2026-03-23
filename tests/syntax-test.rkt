@@ -470,6 +470,39 @@
     (define v (enum-msg-decode (bytes 99 #x00 #x00)))
     (check-equal? (enum-msg-proto v) 99)))
 
+;; Test embedded struct fields
+(struct/wire inner-hdr
+  #:byte-order big
+  (tag  uint 1)
+  (len  uint 2))
+
+(struct/wire outer-msg
+  #:byte-order big
+  (header inner-hdr #:struct)
+  (data   uint 4))
+
+(describe "struct/wire with embedded struct"
+  (it "encodes by accepting bytes for the embedded field"
+    (define hdr-bytes (inner-hdr-encode #:tag #xAA #:len 4))
+    (define bs (outer-msg-encode #:header hdr-bytes #:data #xDEADBEEF))
+    (check-equal? (bytes-length bs) 7)
+    (check-equal? (bytes-ref bs 0) #xAA))
+
+  (it "decodes the embedded field as a struct instance"
+    (define bs (bytes #xAA #x00 #x04 #xDE #xAD #xBE #xEF))
+    (define v (outer-msg-decode bs))
+    (define hdr (outer-msg-header v))
+    (check-pred inner-hdr? hdr)
+    (check-equal? (inner-hdr-tag hdr) #xAA)
+    (check-equal? (inner-hdr-len hdr) 4)
+    (check-equal? (outer-msg-data v) #xDEADBEEF))
+
+  (it "supports match on embedded struct"
+    (define bs (bytes #xBB #x00 #x08 #xCA #xFE #xBA #xBE))
+    (match (outer-msg-decode bs)
+      [(outer-msg #:data d)
+       (check-equal? d #xCAFEBABE)])))
+
 ;; Test padding in struct/wire
 (struct/wire padded-msg
   #:byte-order big

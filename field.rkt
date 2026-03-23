@@ -23,6 +23,7 @@
          field-desc-terminator
          field-desc-repeat
          field-desc-repeated?
+         field-desc-repeat-until
          field-desc-width-in-bits
          field-desc-variable-length?)
 
@@ -54,8 +55,8 @@
 (define (bitfield-type? v)
   (memq v '(uint sint)))
 
-;; Internal struct — 11 fields
-(struct field-desc (name type width byte-order unit bit-order compute contract present-when terminator repeat)
+;; Internal struct — 12 fields
+(struct field-desc (name type width byte-order unit bit-order compute contract present-when terminator repeat repeat-until)
   #:transparent)
 
 ;; Validated constructor
@@ -66,7 +67,8 @@
                          #:contract [contract-fn #f]
                          #:present-when [present-when-fn #f]
                          #:terminator [terminator #f]
-                         #:repeat [repeat-count #f])
+                         #:repeat [repeat-count #f]
+                         #:repeat-until [repeat-until-fn #f])
   (unless (symbol? name)
     (error 'make-field-desc "name must be a symbol, got: ~e" name))
   (unless (field-type? type)
@@ -96,11 +98,12 @@
     (error 'make-field-desc "#:contract must be a procedure, got: ~e" contract-fn))
   (when (and present-when-fn (not (procedure? present-when-fn)))
     (error 'make-field-desc "#:present-when must be a procedure, got: ~e" present-when-fn))
-  (field-desc name type width byte-order unit bit-ord compute-fn contract-fn present-when-fn terminator repeat-count))
+  (field-desc name type width byte-order unit bit-ord compute-fn contract-fn present-when-fn terminator repeat-count repeat-until-fn))
 
 ;; Is this a repeated (array) field?
 (define (field-desc-repeated? fd)
-  (and (field-desc-repeat fd) #t))
+  (or (and (field-desc-repeat fd) #t)
+      (and (field-desc-repeat-until fd) #t)))
 
 ;; Is this a computed field?
 (define (field-desc-computed? fd)

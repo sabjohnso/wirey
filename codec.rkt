@@ -27,16 +27,24 @@
 
 (define (encode pd values)
   (define fields (protocol-desc-fields pd))
-  ;; For computed fields, use 0 as placeholder in values
+  ;; For computed and padding fields, use 0 as placeholder in values
   (define effective-values
     (for/fold ([v values]) ([f (in-list fields)])
-      (if (field-desc-computed? f)
+      (if (or (field-desc-computed? f)
+              (eq? (field-desc-type f) 'padding))
           (hash-set v (field-desc-name f) 0)
           v)))
-  ;; Validate contracts on non-computed fields
+  ;; Helper: check if a conditional field is present
+  (define (field-present? f)
+    (define pw (field-desc-present-when f))
+    (or (not pw)
+        (pw (λ (name) (hash-ref effective-values name)))))
+  ;; Validate contracts on non-computed, non-padding, present fields
   (for ([f (in-list fields)])
     (when (and (field-desc-has-contract? f)
-               (not (field-desc-computed? f)))
+               (not (field-desc-computed? f))
+               (not (eq? (field-desc-type f) 'padding))
+               (field-present? f))
       (define name (field-desc-name f))
       (define val (hash-ref effective-values name))
       (define contract-fn (field-desc-contract f))
@@ -44,12 +52,15 @@
         (error 'encode
                "field '~a': contract violation, value ~e rejected"
                name val))))
-  ;; Compute total size by resolving all widths
+  ;; Compute total size by resolving all widths (skip absent conditional fields)
   (define total
     (let loop ([fields fields] [bit-acc 0] [total 0])
       (cond
         [(null? fields)
          (+ total (quotient bit-acc 8))]
+        [(and (field-desc-conditional? (car fields))
+              (not (field-present? (car fields))))
+         (loop (cdr fields) bit-acc total)]
         [(eq? (field-desc-unit (car fields)) 'bits)
          (loop (cdr fields) (+ bit-acc (field-desc-width (car fields))) total)]
         [else
@@ -62,6 +73,10 @@
   (let loop ([fields fields] [byte-off 0])
     (cond
       [(null? fields) (void)]
+      ;; Skip absent conditional fields
+      [(and (field-desc-conditional? (car fields))
+            (not (field-present? (car fields))))
+       (loop (cdr fields) byte-off)]
       [(eq? (field-desc-unit (car fields)) 'bits)
        ;; Collect entire bitfield group and encode as a unit
        (define-values (group group-bits remaining)
@@ -140,10 +155,11 @@
   (define type (field-desc-type fd))
   (define order (field-desc-byte-order fd))
   (case type
-    [(uint)   (encode-uint! buf offset width order val)]
-    [(sint)   (encode-sint! buf offset width order val)]
-    [(alpha)  (encode-alpha! buf offset width val)]
-    [(octets) (encode-octets! buf offset width val)]))
+    [(uint)    (encode-uint! buf offset width order val)]
+    [(sint)    (encode-sint! buf offset width order val)]
+    [(alpha)   (encode-alpha! buf offset width val)]
+    [(octets)  (encode-octets! buf offset width val)]
+    [(padding) (void)]))
 
 (define (encode-uint! buf offset width order val)
   (case order
@@ -182,6 +198,23 @@
     (cond
       [(null? fields)
        result]
+      ;; Conditional field: check presence predicate
+      [(field-desc-conditional? (car fields))
+       (define f (car fields))
+       (define pw (field-desc-present-when f))
+       (if (pw (λ (name) (hash-ref result name)))
+           ;; Present: decode normally (re-enter loop without the conditional flag)
+           ;; We temporarily wrap in a non-conditional desc for re-entry
+           (let* ([w (if (field-desc-variable-length? f)
+                         (eval-length-expr (field-desc-width f)
+                                           (λ (name) (hash-ref result name)))
+                         (field-desc-width f))]
+                  [val (decode-field-with-width data byte-off f w)])
+             (loop (cdr fields) (+ byte-off w) 0
+                   (hash-set result (field-desc-name f) val)))
+           ;; Absent: store #f and don't advance offset
+           (loop (cdr fields) byte-off bit-off
+                 (hash-set result (field-desc-name f) #f)))]
       [(eq? (field-desc-unit (car fields)) 'bits)
        (define-values (group-fields group-bits remaining)
          (collect-bitfield-group fields))
@@ -227,9 +260,12 @@
                      (eval-length-expr (field-desc-width f)
                                        (λ (name) (hash-ref result name)))
                      (field-desc-width f)))
-       (define val (decode-field-with-width data byte-off f w))
-       (loop (cdr fields) (+ byte-off w) 0
-             (hash-set result (field-desc-name f) val))])))
+       (if (eq? (field-desc-type f) 'padding)
+           ;; Skip padding — advance offset but don't add to result
+           (loop (cdr fields) (+ byte-off w) 0 result)
+           (let ([val (decode-field-with-width data byte-off f w)])
+             (loop (cdr fields) (+ byte-off w) 0
+                   (hash-set result (field-desc-name f) val))))])))
 
 ;; Collect contiguous bit-unit fields that share the same effective bit order.
 ;; Splits when bit order changes between fields.
@@ -260,10 +296,11 @@
   (define type (field-desc-type fd))
   (define order (field-desc-byte-order fd))
   (case type
-    [(uint)   (decode-uint data offset width order)]
-    [(sint)   (decode-sint data offset width order)]
-    [(alpha)  (decode-alpha data offset width)]
-    [(octets) (decode-octets data offset width)]))
+    [(uint)    (decode-uint data offset width order)]
+    [(sint)    (decode-sint data offset width order)]
+    [(alpha)   (decode-alpha data offset width)]
+    [(octets)  (decode-octets data offset width)]
+    [(padding) (void)]))
 
 ;; Decode a single field using its own width (byte-unit, fixed-width only)
 (define (decode-field data offset fd)

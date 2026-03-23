@@ -14,7 +14,9 @@
     (it "recognizes alpha"
       (check-true (field-type? 'alpha)))
     (it "recognizes octets"
-      (check-true (field-type? 'octets))))
+      (check-true (field-type? 'octets)))
+    (it "recognizes padding"
+      (check-true (field-type? 'padding))))
 
   (context "given invalid values"
     (it "rejects unknown symbols"
@@ -186,6 +188,22 @@
     (define f2 (make-field-desc 'port 'uint 2 'big #:contract (λ (v) #t)))
     (check-false (field-desc-has-contract? f1))
     (check-true (field-desc-has-contract? f2))))
+
+(describe "field-desc-present-when"
+  (it "defaults to #f (always present)"
+    (define f (make-field-desc 'val 'uint 4 'big))
+    (check-false (field-desc-present-when f)))
+
+  (it "stores a presence predicate when provided"
+    (define f (make-field-desc 'val 'uint 4 'big
+                               #:present-when (λ (lk) (> (lk 'flags) 0))))
+    (check-pred procedure? (field-desc-present-when f)))
+
+  (it "conditional? predicate works"
+    (define f1 (make-field-desc 'val 'uint 4 'big))
+    (define f2 (make-field-desc 'val 'uint 4 'big #:present-when (λ (lk) #t)))
+    (check-false (field-desc-conditional? f1))
+    (check-true (field-desc-conditional? f2))))
 
 (describe "field-desc-compute"
   (it "defaults to #f (no compute function)"

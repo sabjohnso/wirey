@@ -18,13 +18,15 @@
          field-desc-computed?
          field-desc-contract
          field-desc-has-contract?
+         field-desc-present-when
+         field-desc-conditional?
          field-desc-width-in-bits
          field-desc-variable-length?)
 
 ;; Valid field types
 (define (field-type? v)
   (and (symbol? v)
-       (memq v '(uint sint alpha octets))
+       (memq v '(uint sint alpha octets padding))
        #t))
 
 ;; Valid byte orderings
@@ -49,8 +51,8 @@
 (define (bitfield-type? v)
   (memq v '(uint sint)))
 
-;; Internal struct — 8 fields
-(struct field-desc (name type width byte-order unit bit-order compute contract)
+;; Internal struct — 9 fields
+(struct field-desc (name type width byte-order unit bit-order compute contract present-when)
   #:transparent)
 
 ;; Validated constructor
@@ -58,7 +60,8 @@
                          #:unit [unit 'bytes]
                          #:bit-order [bit-ord #f]
                          #:compute [compute-fn #f]
-                         #:contract [contract-fn #f])
+                         #:contract [contract-fn #f]
+                         #:present-when [present-when-fn #f])
   (unless (symbol? name)
     (error 'make-field-desc "name must be a symbol, got: ~e" name))
   (unless (field-type? type)
@@ -86,7 +89,9 @@
     (error 'make-field-desc "#:compute must be a procedure, got: ~e" compute-fn))
   (when (and contract-fn (not (procedure? contract-fn)))
     (error 'make-field-desc "#:contract must be a procedure, got: ~e" contract-fn))
-  (field-desc name type width byte-order unit bit-ord compute-fn contract-fn))
+  (when (and present-when-fn (not (procedure? present-when-fn)))
+    (error 'make-field-desc "#:present-when must be a procedure, got: ~e" present-when-fn))
+  (field-desc name type width byte-order unit bit-ord compute-fn contract-fn present-when-fn))
 
 ;; Is this a computed field?
 (define (field-desc-computed? fd)
@@ -95,6 +100,10 @@
 ;; Does this field have a contract?
 (define (field-desc-has-contract? fd)
   (and (field-desc-contract fd) #t))
+
+;; Is this a conditional field?
+(define (field-desc-conditional? fd)
+  (and (field-desc-present-when fd) #t))
 
 ;; Is this a variable-length field?
 (define (field-desc-variable-length? fd)

@@ -525,3 +525,115 @@
                                        #:contract always-valid?))))
     ;; Should not raise — computed fields aren't checked at encode time
     (check-not-exn (λ () (encode p (hasheq 'val 1))))))
+
+;; ===== Padding and Alignment =====
+
+(describe "encode (padding)"
+  (it "encodes padding as zero bytes"
+    (define p (make-protocol-desc 'msg
+                (list (make-field-desc 'tag 'uint 1 'big)
+                      (make-field-desc 'pad 'padding 3 'big)
+                      (make-field-desc 'val 'uint 4 'big))))
+    (define bs (encode p (hasheq 'tag #xAA 'val #xDEADBEEF)))
+    (check-equal? bs (bytes #xAA #x00 #x00 #x00 #xDE #xAD #xBE #xEF)))
+
+  (it "padding fields are not required in values hash"
+    (define p (make-protocol-desc 'msg
+                (list (make-field-desc 'tag 'uint 1 'big)
+                      (make-field-desc 'pad 'padding 2 'big)
+                      (make-field-desc 'val 'uint 1 'big))))
+    (check-not-exn
+     (λ () (encode p (hasheq 'tag 1 'val 2))))))
+
+(describe "decode (padding)"
+  (it "skips padding fields in decoded hash"
+    (define p (make-protocol-desc 'msg
+                (list (make-field-desc 'tag 'uint 1 'big)
+                      (make-field-desc 'pad 'padding 3 'big)
+                      (make-field-desc 'val 'uint 4 'big))))
+    (define v (decode p (bytes #xAA #x00 #x00 #x00 #xDE #xAD #xBE #xEF)))
+    (check-equal? (hash-ref v 'tag) #xAA)
+    (check-equal? (hash-ref v 'val) #xDEADBEEF)
+    (check-false (hash-has-key? v 'pad)))
+
+  (it "correctly offsets fields after padding"
+    (define p (make-protocol-desc 'msg
+                (list (make-field-desc 'a 'uint 1 'big)
+                      (make-field-desc 'pad 'padding 5 'big)
+                      (make-field-desc 'b 'uint 2 'big))))
+    (define v (decode p (bytes #x01 0 0 0 0 0 #x00 #x42)))
+    (check-equal? (hash-ref v 'a) 1)
+    (check-equal? (hash-ref v 'b) #x42)))
+
+;; ===== Conditional Presence =====
+
+(describe "encode (conditional fields)"
+  (it "includes field when predicate is true"
+    (define p (make-protocol-desc 'msg
+                (list (make-field-desc 'flags 'uint 1 'big)
+                      (make-field-desc 'extra 'uint 2 'big
+                                       #:present-when (λ (lk) (> (lk 'flags) 0))))))
+    (define bs (encode p (hasheq 'flags 1 'extra #x1234)))
+    (check-equal? bs (bytes 1 #x12 #x34)))
+
+  (it "excludes field when predicate is false"
+    (define p (make-protocol-desc 'msg
+                (list (make-field-desc 'flags 'uint 1 'big)
+                      (make-field-desc 'extra 'uint 2 'big
+                                       #:present-when (λ (lk) (> (lk 'flags) 0))))))
+    (define bs (encode p (hasheq 'flags 0 'extra #x1234)))
+    ;; extra is absent — only flags byte
+    (check-equal? bs (bytes 0)))
+
+  (it "handles fields after conditional correctly"
+    (define p (make-protocol-desc 'msg
+                (list (make-field-desc 'flags 'uint 1 'big)
+                      (make-field-desc 'opt   'uint 2 'big
+                                       #:present-when (λ (lk) (> (lk 'flags) 0)))
+                      (make-field-desc 'tail  'uint 1 'big))))
+    ;; With opt present
+    (check-equal? (encode p (hasheq 'flags 1 'opt #xABCD 'tail #xFF))
+                  (bytes 1 #xAB #xCD #xFF))
+    ;; Without opt
+    (check-equal? (encode p (hasheq 'flags 0 'opt 0 'tail #xFF))
+                  (bytes 0 #xFF))))
+
+(describe "decode (conditional fields)"
+  (it "decodes field when predicate is true"
+    (define p (make-protocol-desc 'msg
+                (list (make-field-desc 'flags 'uint 1 'big)
+                      (make-field-desc 'extra 'uint 2 'big
+                                       #:present-when (λ (lk) (> (lk 'flags) 0))))))
+    (define v (decode p (bytes 1 #x12 #x34)))
+    (check-equal? (hash-ref v 'flags) 1)
+    (check-equal? (hash-ref v 'extra) #x1234))
+
+  (it "returns #f for absent field"
+    (define p (make-protocol-desc 'msg
+                (list (make-field-desc 'flags 'uint 1 'big)
+                      (make-field-desc 'extra 'uint 2 'big
+                                       #:present-when (λ (lk) (> (lk 'flags) 0))))))
+    (define v (decode p (bytes 0)))
+    (check-equal? (hash-ref v 'flags) 0)
+    (check-equal? (hash-ref v 'extra) #f))
+
+  (it "correctly offsets fields after absent conditional"
+    (define p (make-protocol-desc 'msg
+                (list (make-field-desc 'flags 'uint 1 'big)
+                      (make-field-desc 'opt   'uint 2 'big
+                                       #:present-when (λ (lk) (> (lk 'flags) 0)))
+                      (make-field-desc 'tail  'uint 1 'big))))
+    (define v (decode p (bytes 0 #xFF)))
+    (check-equal? (hash-ref v 'flags) 0)
+    (check-equal? (hash-ref v 'opt) #f)
+    (check-equal? (hash-ref v 'tail) #xFF))
+
+  (it "round-trips with conditional present"
+    (define p (make-protocol-desc 'msg
+                (list (make-field-desc 'flags 'uint 1 'big)
+                      (make-field-desc 'opt   'uint 2 'big
+                                       #:present-when (λ (lk) (> (lk 'flags) 0)))
+                      (make-field-desc 'tail  'uint 1 'big))))
+    (define v (hasheq 'flags 1 'opt #xABCD 'tail #xFF))
+    (check-equal? (decode p (encode p v)) v)))
+

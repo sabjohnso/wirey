@@ -59,21 +59,31 @@
                       (hash-set dec (field-desc-name gf) val)))))]
       [else
        (define f (car fs))
-       (define w (if (field-desc-variable-length? f)
-                     (eval-length-expr (field-desc-width f)
-                                       (λ (name) (hash-ref decoded name)))
-                     (field-desc-width f)))
-       ;; Decode this field's value for potential use by later field-refs
-       (define val
-         (cond
-           [(eq? (field-desc-type f) 'uint)
-            (decode-uint-simple data byte-off w (field-desc-byte-order f))]
-           [(eq? (field-desc-type f) 'sint)
-            (decode-sint-simple data byte-off w (field-desc-byte-order f))]
-           [else #f]))  ; alpha/octets don't need to be cached for field-ref
-       (vector-set! boundaries i (list 'byte byte-off w))
-       (loop (cdr fs) (+ byte-off w) 0 (+ i 1)
-             (if val (hash-set decoded (field-desc-name f) val) decoded))])))
+       ;; Check conditional presence
+       (define pw (field-desc-present-when f))
+       (cond
+         [(and pw (not (pw (λ (name) (hash-ref decoded name)))))
+          ;; Field absent — store marker, don't advance offset
+          (vector-set! boundaries i (list 'absent))
+          (loop (cdr fs) byte-off 0 (+ i 1)
+                (hash-set decoded (field-desc-name f) #f))]
+         [else
+          (define w (if (field-desc-variable-length? f)
+                        (eval-length-expr (field-desc-width f)
+                                          (λ (name) (hash-ref decoded name)))
+                        (field-desc-width f)))
+          ;; Decode this field's value for potential use by later field-refs
+          (define val
+            (cond
+              [(eq? (field-desc-type f) 'padding) #f]
+              [(eq? (field-desc-type f) 'uint)
+               (decode-uint-simple data byte-off w (field-desc-byte-order f))]
+              [(eq? (field-desc-type f) 'sint)
+               (decode-sint-simple data byte-off w (field-desc-byte-order f))]
+              [else #f]))
+          (vector-set! boundaries i (list 'byte byte-off w))
+          (loop (cdr fs) (+ byte-off w) 0 (+ i 1)
+                (if val (hash-set decoded (field-desc-name f) val) decoded))])])))
 
 ;; Simple uint decode for boundary computation
 (define (decode-uint-simple data offset width order)
@@ -167,21 +177,69 @@
                    #:defaults ([default-bito #f]))
         field-clause ...)
 
-     ;; Parse field clauses: 8-element list
+     ;; Parse field clauses: 9-element list
      ;; (name type width-stx byte-order-or-#f unit-or-#f
-     ;;  bit-order-or-#f compute-or-#f contract-or-#f)
-     (define field-infos
+     ;;  bit-order-or-#f compute-or-#f contract-or-#f align-or-#f)
+     (define raw-field-infos
        (for/list ([fc (in-list (syntax->list #'(field-clause ...)))])
          (syntax-parse fc
+           ;; Padding with #:align — no explicit width
+           [(fname:id ftype:id #:align falign:nat)
+            #:when (eq? (syntax-e #'ftype) 'padding)
+            (list #'fname #'ftype #f
+                  #f #f #f #f #f (syntax-e #'falign) #f)]
+           ;; Normal field clause
            [(fname:id ftype:id fwidth
                       (~optional (~seq #:byte-order fbo:id))
                       (~optional (~seq #:unit funit:id))
                       (~optional (~seq #:bit-order fbito:id))
                       (~optional (~seq #:compute fcompute:expr))
-                      (~optional (~seq #:contract fcontract:expr)))
+                      (~optional (~seq #:contract fcontract:expr))
+                      (~optional (~seq #:present-when fpresent:expr)))
             (list #'fname #'ftype #'fwidth
                   (attribute fbo) (attribute funit) (attribute fbito)
-                  (attribute fcompute) (attribute fcontract))])))
+                  (attribute fcompute) (attribute fcontract) #f
+                  (attribute fpresent))])))
+
+     ;; Resolve #:align padding widths based on static offsets.
+     ;; Walks fields, tracks byte offset, computes padding for #:align fields.
+     (define field-infos
+       (let loop ([infos raw-field-infos] [byte-off 0] [bit-acc 0] [acc '()])
+         (cond
+           [(null? infos)
+            (reverse acc)]
+           ;; Auto-align padding: compute width from current offset
+           [(ninth (car infos))
+            (define info (car infos))
+            (define align-val (ninth info))
+            ;; Flush any accumulated bits first
+            (define flush-bytes (if (> bit-acc 0) (quotient bit-acc 8) 0))
+            (define cur-off (+ byte-off flush-bytes))
+            (define pad-width (modulo (- align-val (modulo cur-off align-val)) align-val))
+            (if (zero? pad-width)
+                ;; Already aligned — skip this padding field
+                (loop (cdr infos) cur-off 0 acc)
+                ;; Insert padding with computed width
+                (let ([new-info (list (first info)
+                                     (second info)
+                                     (datum->syntax (first info) pad-width)
+                                     #f #f #f #f #f #f #f)])
+                  (loop (cdr infos) (+ cur-off pad-width) 0 (cons new-info acc))))]
+           ;; Bitfield: accumulate bits
+           [(and (fifth (car infos))
+                 (eq? (syntax-e (fifth (car infos))) 'bits))
+            (define info (car infos))
+            (define w (syntax-e (third info)))
+            (define new-bits (+ bit-acc w))
+            (if (zero? (modulo new-bits 8))
+                (loop (cdr infos) (+ byte-off (quotient new-bits 8)) 0 (cons info acc))
+                (loop (cdr infos) byte-off new-bits (cons info acc)))]
+           ;; Normal byte field
+           [else
+            (define info (car infos))
+            (define flush-bytes (if (> bit-acc 0) (quotient bit-acc 8) 0))
+            (define w (if (third info) (if (nat-stx? (third info)) (syntax-e (third info)) 0) 0))
+            (loop (cdr infos) (+ byte-off flush-bytes w) 0 (cons info acc))])))
 
      (define field-names  (map first field-infos))
      (define field-widths (map third field-infos))
@@ -191,8 +249,12 @@
        (define w (third info))
        (not (let ([v (syntax-e w)]) (and (integer? v) (exact? v) (>= v 0)))))
 
+     (define (field-conditional? info)
+       (and (tenth info) #t))
+
      (define has-variable-fields?
-       (ormap variable-width? field-infos))
+       (ormap (λ (info) (or (variable-width? info) (field-conditional? info)))
+              field-infos))
 
      (define (bitfield? info)
        (define u (fifth info))
@@ -287,6 +349,9 @@
      (define (field-computed? info)
        (and (seventh info) #t))
 
+     (define (field-padding? info)
+       (eq? (syntax-e (second info)) 'padding))
+
      (define fd-exprs
        (for/list ([info field-infos])
          (define fn (first info))
@@ -294,9 +359,11 @@
          (define fw-stx (third info))
          (define fb (fourth info))
          (define fu (fifth info))
-         (define fbi (sixth info))   ;; bit-order
-         (define fc (seventh info))  ;; compute
-         (define fk (eighth info))   ;; contract
+         (define fbi (sixth info))    ;; bit-order
+         (define fc (seventh info))   ;; compute
+         (define fk (eighth info))    ;; contract
+         ;; ninth = align (already resolved)
+         (define fp (tenth info))     ;; present-when
          (define bo-expr (if fb #`'#,fb #`'default-bo))
          (define width-arg (width-stx->expr fw-stx))
          ;; Resolve effective bit-order for this field
@@ -307,12 +374,14 @@
            (append (if fu (list #'#:unit #`'#,fu) '())
                    (if effective-bito (list #'#:bit-order #`'#,effective-bito) '())
                    (if fc (list #'#:compute fc) '())
-                   (if fk (list #'#:contract fk) '())))
+                   (if fk (list #'#:contract fk) '())
+                   (if fp (list #'#:present-when fp) '())))
          #`(make-field-desc '#,fn '#,ft #,width-arg #,bo-expr #,@kw-args)))
 
-     ;; Encode function formals: exclude computed fields from keyword args
+     ;; Encode function formals: exclude computed and padding fields from keyword args
      (define encode-sorted-idxs
-       (filter (λ (i) (not (field-computed? (list-ref field-infos i))))
+       (filter (λ (i) (define info (list-ref field-infos i))
+                       (not (or (field-computed? info) (field-padding? info))))
                sorted-idxs))
 
      (define encode-sorted-params
@@ -333,18 +402,20 @@
                 (define fn (list-ref field-names i))
                 (list #`'#,fn param))))
 
-     ;; Accessor definitions
+     ;; Accessor definitions (skip padding fields)
      (define accessor-defs
        (if has-variable-fields?
            ;; Dynamic accessors using precomputed boundaries
            (for/list ([aid accessor-ids]
                       [fn field-names]
                       [info field-infos]
-                      [idx field-indices])
+                      [idx field-indices]
+                      #:unless (field-padding? info))
              (define ft (second info))
              #`(define (#,aid v)
                  (define bounds (vector-ref (#,inst-bounds v) #,idx))
                  (case (car bounds)
+                   [(absent) #f]
                    [(byte)
                     (decode-field (#,inst-bytes v) (second bounds)
                                  (make-field-desc '#,fn '#,ft (third bounds)
@@ -360,7 +431,8 @@
            (for/list ([aid accessor-ids]
                       [fn field-names]
                       [info field-infos]
-                      [ai static-accessor-infos])
+                      [ai static-accessor-infos]
+                      #:unless (field-padding? info))
              (define ft (second info))
              (case (car ai)
                [(byte)
@@ -384,10 +456,12 @@
                                      '#,ft
                                      #:bit-order '#,(datum->syntax #'sname bit-ord)))]))))
 
-     ;; Accessor table for match expander
+     ;; Accessor table for match expander (skip padding)
      (define accessor-table-for-match
        (for/list ([fn field-names]
-                  [aid accessor-ids])
+                  [aid accessor-ids]
+                  [info field-infos]
+                  #:unless (field-padding? info))
          (cons (symbol->string (syntax-e fn)) aid)))
 
      #`(begin

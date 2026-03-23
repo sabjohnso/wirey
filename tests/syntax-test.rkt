@@ -391,3 +391,96 @@
       (check-equal? (contracted-msg-port v) 80)
       (check-equal? (contracted-msg-count v) 3)
       (check-equal? (contracted-msg-data v) #xFF))))
+
+;; Test conditional presence in struct/wire
+(struct/wire conditional-msg
+  #:byte-order big
+  (flags uint 1)
+  (opt   uint 2 #:present-when (λ (lk) (> (lk 'flags) 0)))
+  (tail  uint 1))
+
+(describe "struct/wire with conditional fields"
+  (it "encodes with conditional present"
+    (define bs (conditional-msg-encode #:flags 1 #:opt #xABCD #:tail #xFF))
+    (check-equal? bs (bytes 1 #xAB #xCD #xFF)))
+
+  (it "encodes with conditional absent"
+    (define bs (conditional-msg-encode #:flags 0 #:opt 0 #:tail #xFF))
+    (check-equal? bs (bytes 0 #xFF)))
+
+  (it "decodes with conditional present"
+    (define v (conditional-msg-decode (bytes 1 #xAB #xCD #xFF)))
+    (check-equal? (conditional-msg-flags v) 1)
+    (check-equal? (conditional-msg-opt v) #xABCD)
+    (check-equal? (conditional-msg-tail v) #xFF))
+
+  (it "decodes with conditional absent"
+    (define v (conditional-msg-decode (bytes 0 #xFF)))
+    (check-equal? (conditional-msg-flags v) 0)
+    (check-equal? (conditional-msg-opt v) #f)
+    (check-equal? (conditional-msg-tail v) #xFF)))
+
+;; Test padding in struct/wire
+(struct/wire padded-msg
+  #:byte-order big
+  (tag  uint    1)
+  (pad  padding 3)
+  (val  uint    4))
+
+(describe "struct/wire with padding"
+  (it "does not generate a keyword arg for padding"
+    ;; Only #:tag and #:val — no #:pad
+    (define bs (padded-msg-encode #:tag #xAA #:val #xDEADBEEF))
+    (check-equal? bs (bytes #xAA 0 0 0 #xDE #xAD #xBE #xEF)))
+
+  (it "does not generate an accessor for padding"
+    (define v (padded-msg-decode (bytes #xAA 0 0 0 #xDE #xAD #xBE #xEF)))
+    (check-equal? (padded-msg-tag v) #xAA)
+    (check-equal? (padded-msg-val v) #xDEADBEEF))
+
+  (it "correctly offsets fields after padding"
+    (define bs (padded-msg-encode #:tag #x01 #:val #x02030405))
+    (define v (padded-msg-decode bs))
+    (check-equal? (padded-msg-tag v) #x01)
+    (check-equal? (padded-msg-val v) #x02030405)))
+
+;; Test auto-alignment padding
+(struct/wire aligned-msg
+  #:byte-order big
+  (tag   uint    1)
+  (pad1  padding #:align 4)
+  (value uint    4)
+  (short uint    2)
+  (pad2  padding #:align 4)
+  (data  uint    4))
+
+(describe "struct/wire with auto-alignment padding"
+  (it "computes correct padding widths"
+    ;; tag at 0 (1 byte), pad1=3 to reach 4, value at 4 (4 bytes),
+    ;; short at 8 (2 bytes), pad2=2 to reach 12, data at 12 (4 bytes)
+    ;; total = 16
+    (define bs (aligned-msg-encode #:tag #xAA #:value #x01020304
+                                   #:short #x0506 #:data #x0708090A))
+    (check-equal? (bytes-length bs) 16)
+    (check-equal? (bytes-ref bs 0) #xAA)
+    ;; bytes 1-3 are padding zeros
+    (check-equal? (subbytes bs 1 4) (bytes 0 0 0))
+    ;; value at offset 4
+    (check-equal? (subbytes bs 4 8) (bytes #x01 #x02 #x03 #x04))
+    ;; short at offset 8
+    (check-equal? (subbytes bs 8 10) (bytes #x05 #x06))
+    ;; bytes 10-11 are padding zeros
+    (check-equal? (subbytes bs 10 12) (bytes 0 0))
+    ;; data at offset 12
+    (check-equal? (subbytes bs 12 16) (bytes #x07 #x08 #x09 #x0A)))
+
+  (it "decodes correctly through auto-alignment padding"
+    (define bs (bytes #xAA 0 0 0
+                      #x01 #x02 #x03 #x04
+                      #x05 #x06 0 0
+                      #x07 #x08 #x09 #x0A))
+    (define v (aligned-msg-decode bs))
+    (check-equal? (aligned-msg-tag v) #xAA)
+    (check-equal? (aligned-msg-value v) #x01020304)
+    (check-equal? (aligned-msg-short v) #x0506)
+    (check-equal? (aligned-msg-data v) #x0708090A)))

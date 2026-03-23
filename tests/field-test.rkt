@@ -51,6 +51,20 @@
     (it "rejects non-symbols"
       (check-false (field-unit? 8)))))
 
+(describe "bit-order?"
+  (context "given valid bit orders"
+    (it "recognizes msb"
+      (check-true (bit-order? 'msb)))
+    (it "recognizes lsb"
+      (check-true (bit-order? 'lsb))))
+
+  (context "given invalid values"
+    (it "rejects unknown symbols"
+      (check-false (bit-order? 'big))
+      (check-false (bit-order? 'network)))
+    (it "rejects non-symbols"
+      (check-false (bit-order? 42)))))
+
 (describe "make-field-desc"
   (context "given valid arguments (byte-width fields)"
     (it "stores name, type, width, and byte-order"
@@ -83,7 +97,27 @@
     (it "accepts various bit widths"
       (check-not-exn (λ () (make-field-desc 'a 'uint 1 'big #:unit 'bits)))
       (check-not-exn (λ () (make-field-desc 'b 'uint 3 'big #:unit 'bits)))
-      (check-not-exn (λ () (make-field-desc 'c 'uint 13 'big #:unit 'bits)))))
+      (check-not-exn (λ () (make-field-desc 'c 'uint 13 'big #:unit 'bits))))
+
+    (it "defaults bit-order to #f (inherit)"
+      (define f (make-field-desc 'a 'uint 4 'big #:unit 'bits))
+      (check-false (field-desc-bit-order f)))
+
+    (it "stores bit-order when specified"
+      (define f (make-field-desc 'a 'uint 4 'big #:unit 'bits #:bit-order 'lsb))
+      (check-eq? (field-desc-bit-order f) 'lsb))
+
+    (it "accepts msb bit-order"
+      (check-not-exn
+       (λ () (make-field-desc 'a 'uint 4 'big #:unit 'bits #:bit-order 'msb))))
+
+    (it "rejects invalid bit-order"
+      (check-exn exn:fail?
+        (λ () (make-field-desc 'a 'uint 4 'big #:unit 'bits #:bit-order 'big))))
+
+    (it "rejects bit-order on byte-unit fields"
+      (check-exn exn:fail?
+        (λ () (make-field-desc 'a 'uint 4 'big #:bit-order 'msb)))))
 
   (context "bitfield type restrictions"
     (it "rejects alpha with bits unit"

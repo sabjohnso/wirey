@@ -320,6 +320,66 @@
                         'flags 2 'frag 0))
       (check-equal? (decode p (encode p v)) v))))
 
+;; ===== LSB Bit Ordering =====
+
+(describe "encode (LSB bitfields)"
+  (context "two 4-bit nibbles LSB-first"
+    (it "encodes a=0xF, b=0x0 as 0x0F (a in low bits)"
+      (define p (make-protocol-desc 'test
+                  (list (make-field-desc 'a 'uint 4 'big #:unit 'bits #:bit-order 'lsb)
+                        (make-field-desc 'b 'uint 4 'big #:unit 'bits #:bit-order 'lsb))))
+      ;; LSB-first: a occupies bits 0-3, b occupies bits 4-7
+      ;; a=0xF → bits 0-3 = 1111, b=0x0 → bits 4-7 = 0000 → byte = 0x0F
+      (check-equal? (encode p (hasheq 'a #xF 'b 0))
+                    (bytes #x0F))))
+
+  (context "3+5 bit LSB split"
+    (it "encodes flags=7, value=0 as 0x07"
+      (define p (make-protocol-desc 'test
+                  (list (make-field-desc 'flags 'uint 3 'big #:unit 'bits #:bit-order 'lsb)
+                        (make-field-desc 'value 'uint 5 'big #:unit 'bits #:bit-order 'lsb))))
+      ;; LSB: flags in bits 0-2 = 111, value in bits 3-7 = 00000 → 0x07
+      (check-equal? (encode p (hasheq 'flags 7 'value 0))
+                    (bytes #x07))))
+
+  (context "mixed MSB and LSB groups"
+    (it "encodes MSB group then LSB group correctly"
+      (define p (make-protocol-desc 'test
+                  (list (make-field-desc 'msb-hi 'uint 4 'big #:unit 'bits)
+                        (make-field-desc 'msb-lo 'uint 4 'big #:unit 'bits)
+                        (make-field-desc 'lsb-a  'uint 4 'big #:unit 'bits #:bit-order 'lsb)
+                        (make-field-desc 'lsb-b  'uint 4 'big #:unit 'bits #:bit-order 'lsb))))
+      ;; MSB group: hi=0xA, lo=0x5 → 0xA5
+      ;; LSB group: a=0xF, b=0x0 → 0x0F
+      (check-equal? (encode p (hasheq 'msb-hi #xA 'msb-lo #x5
+                                      'lsb-a #xF 'lsb-b #x0))
+                    (bytes #xA5 #x0F)))))
+
+(describe "decode (LSB bitfields)"
+  (context "two 4-bit nibbles LSB-first"
+    (it "decodes 0x0F as a=0xF, b=0x0"
+      (define p (make-protocol-desc 'test
+                  (list (make-field-desc 'a 'uint 4 'big #:unit 'bits #:bit-order 'lsb)
+                        (make-field-desc 'b 'uint 4 'big #:unit 'bits #:bit-order 'lsb))))
+      (define v (decode p (bytes #x0F)))
+      (check-equal? (hash-ref v 'a) #xF)
+      (check-equal? (hash-ref v 'b) 0)))
+
+  (context "round-trip"
+    (it "decode(encode(v)) = v for LSB bitfields"
+      (define p (make-protocol-desc 'test
+                  (list (make-field-desc 'a 'uint 4 'big #:unit 'bits #:bit-order 'lsb)
+                        (make-field-desc 'b 'uint 4 'big #:unit 'bits #:bit-order 'lsb))))
+      (define v (hasheq 'a 3 'b 12))
+      (check-equal? (decode p (encode p v)) v))
+
+    (it "decode(encode(v)) = v for LSB 3+5 split"
+      (define p (make-protocol-desc 'test
+                  (list (make-field-desc 'flags 'uint 3 'big #:unit 'bits #:bit-order 'lsb)
+                        (make-field-desc 'value 'uint 5 'big #:unit 'bits #:bit-order 'lsb))))
+      (define v (hasheq 'flags 5 'value 19))
+      (check-equal? (decode p (encode p v)) v))))
+
 ;; ===== Variable-Length Encoding =====
 
 (describe "encode (variable-length)"

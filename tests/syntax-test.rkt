@@ -239,6 +239,30 @@
          (check-equal? ver 4)
          (check-equal? tl 1500)]))))
 
+;; Test LSB bit-order in struct/wire
+(struct/wire lsb-msg
+  #:byte-order big
+  #:bit-order lsb
+  (lo uint 4 #:unit bits)
+  (hi uint 4 #:unit bits))
+
+(describe "struct/wire with #:bit-order lsb"
+  (it "encodes LSB-first"
+    (define bs (lsb-msg-encode #:lo #xF #:hi 0))
+    ;; LSB: lo in bits 0-3, hi in bits 4-7 → 0x0F
+    (check-equal? bs (bytes #x0F)))
+
+  (it "decodes LSB-first via accessors"
+    (define v (lsb-msg-decode (bytes #x0F)))
+    (check-equal? (lsb-msg-lo v) #xF)
+    (check-equal? (lsb-msg-hi v) 0))
+
+  (it "round-trips"
+    (define bs (lsb-msg-encode #:lo 3 #:hi 12))
+    (define v (lsb-msg-decode bs))
+    (check-equal? (lsb-msg-lo v) 3)
+    (check-equal? (lsb-msg-hi v) 12)))
+
 ;; Test variable-length struct/wire
 (struct/wire framed-msg
   #:byte-order big

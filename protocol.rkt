@@ -15,22 +15,33 @@
 (struct protocol-desc (name fields) #:transparent)
 
 ;; Validate that contiguous bitfield groups sum to whole bytes.
+;; Groups are split by: non-bit fields, or bit-order changes.
 (define (validate-bitfield-groups fields)
-  (let loop ([fields fields] [bit-acc 0])
+  (define (effective-order f)
+    (or (field-desc-bit-order f) 'msb))
+  (define (flush-check bit-acc)
+    (unless (zero? (remainder bit-acc 8))
+      (error 'make-protocol-desc
+             "bitfield group has ~a bits, which is not a whole number of bytes"
+             bit-acc)))
+  (let loop ([fields fields] [bit-acc 0] [group-order #f])
     (cond
       [(null? fields)
-       (unless (zero? (remainder bit-acc 8))
-         (error 'make-protocol-desc
-                "bitfield group has ~a bits, which is not a whole number of bytes"
-                bit-acc))]
+       (flush-check bit-acc)]
       [(eq? (field-desc-unit (car fields)) 'bits)
-       (loop (cdr fields) (+ bit-acc (field-desc-width (car fields))))]
+       (define f (car fields))
+       (define fo (effective-order f))
+       (cond
+         ;; Same group — accumulate
+         [(or (not group-order) (eq? group-order fo))
+          (loop (cdr fields) (+ bit-acc (field-desc-width f)) fo)]
+         ;; Bit order changed — flush previous group, start new one
+         [else
+          (flush-check bit-acc)
+          (loop (cdr fields) (field-desc-width f) fo)])]
       [else
-       (unless (zero? (remainder bit-acc 8))
-         (error 'make-protocol-desc
-                "bitfield group has ~a bits, which is not a whole number of bytes"
-                bit-acc))
-       (loop (cdr fields) 0)])))
+       (flush-check bit-acc)
+       (loop (cdr fields) 0 #f)])))
 
 ;; Validate that variable-length fields reference existing earlier fields.
 (define (validate-variable-length-refs fields)

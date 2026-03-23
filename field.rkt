@@ -5,6 +5,7 @@
 (provide field-type?
          byte-order?
          field-unit?
+         bit-order?
          make-field-desc
          field-desc?
          field-desc-name
@@ -12,6 +13,7 @@
          field-desc-width
          field-desc-byte-order
          field-desc-unit
+         field-desc-bit-order
          field-desc-compute
          field-desc-computed?
          field-desc-contract
@@ -37,16 +39,24 @@
        (memq v '(bytes bits))
        #t))
 
+;; Valid bit orderings
+(define (bit-order? v)
+  (and (symbol? v)
+       (memq v '(msb lsb))
+       #t))
+
 ;; Types allowed for bitfields (bit-unit)
 (define (bitfield-type? v)
   (memq v '(uint sint)))
 
-;; Internal struct — 6th field is compute, 7th is contract
-(struct field-desc (name type width byte-order unit compute contract) #:transparent)
+;; Internal struct — 8 fields
+(struct field-desc (name type width byte-order unit bit-order compute contract)
+  #:transparent)
 
 ;; Validated constructor
 (define (make-field-desc name type width byte-order
                          #:unit [unit 'bytes]
+                         #:bit-order [bit-ord #f]
                          #:compute [compute-fn #f]
                          #:contract [contract-fn #f])
   (unless (symbol? name)
@@ -61,6 +71,11 @@
     (error 'make-field-desc "invalid byte-order: ~e" byte-order))
   (unless (field-unit? unit)
     (error 'make-field-desc "invalid unit: ~e" unit))
+  (when (and bit-ord (not (bit-order? bit-ord)))
+    (error 'make-field-desc "invalid bit-order: ~e" bit-ord))
+  (when (and bit-ord (not (eq? unit 'bits)))
+    (error 'make-field-desc
+           "bit-order can only be specified on bit-unit fields, got unit: ~e" unit))
   (when (and (eq? unit 'bits) (not (bitfield-type? type)))
     (error 'make-field-desc
            "bit-unit fields must be uint or sint, got type: ~e" type))
@@ -71,7 +86,7 @@
     (error 'make-field-desc "#:compute must be a procedure, got: ~e" compute-fn))
   (when (and contract-fn (not (procedure? contract-fn)))
     (error 'make-field-desc "#:contract must be a procedure, got: ~e" contract-fn))
-  (field-desc name type width byte-order unit compute-fn contract-fn))
+  (field-desc name type width byte-order unit bit-ord compute-fn contract-fn))
 
 ;; Is this a computed field?
 (define (field-desc-computed? fd)

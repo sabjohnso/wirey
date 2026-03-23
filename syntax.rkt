@@ -28,13 +28,12 @@
     (cond
       [(null? fs) boundaries]
       [(eq? (field-desc-unit (car fs)) 'bits)
-       ;; Collect bitfield group
+       ;; Collect bitfield group (split on bit-order change)
+       ;; Uses collect-bitfield-group from wirey/codec
        (define-values (group group-bits remaining)
-         (let grp ([is fs] [g '()] [bits 0])
-           (if (and (pair? is) (eq? (field-desc-unit (car is)) 'bits))
-               (grp (cdr is) (cons (car is) g) (+ bits (field-desc-width (car is))))
-               (values (reverse g) bits is))))
+         (collect-bitfield-group fs))
        (define group-bytes (quotient group-bits 8))
+       (define bit-ord (resolve-group-bit-order group))
        ;; Read the group to decode bitfield values (needed for later field-ref lookups)
        (define raw
          (for/fold ([acc 0]) ([bi (in-range group-bytes)])
@@ -46,11 +45,16 @@
              (loop remaining (+ byte-off group-bytes) 0 gi dec)
              (let* ([gf (car gs)]
                     [gw (field-desc-width gf)]
-                    [shift (- group-bits bit-pos gw)]
-                    [val (bitwise-and (arithmetic-shift raw (- shift))
-                                     (sub1 (arithmetic-shift 1 gw)))])
-               ;; Store (group-byte-off group-bytes bit-pos bit-width) for bitfields
-               (vector-set! boundaries gi (list 'bits byte-off group-bytes bit-pos gw))
+                    [val (case bit-ord
+                           [(msb)
+                            (define shift (- group-bits bit-pos gw))
+                            (bitwise-and (arithmetic-shift raw (- shift))
+                                         (sub1 (arithmetic-shift 1 gw)))]
+                           [(lsb)
+                            (bitwise-and (arithmetic-shift raw (- bit-pos))
+                                         (sub1 (arithmetic-shift 1 gw)))])])
+               ;; Store (group-byte-off group-bytes bit-pos bit-width bit-order)
+               (vector-set! boundaries gi (list 'bits byte-off group-bytes bit-pos gw bit-ord))
                (gloop (cdr gs) (+ bit-pos gw) (+ gi 1)
                       (hash-set dec (field-desc-name gf) val)))))]
       [else
@@ -159,21 +163,24 @@
     [(_ sname:id
         (~optional (~seq #:byte-order default-bo:id)
                    #:defaults ([default-bo #'big]))
+        (~optional (~seq #:bit-order default-bito:id)
+                   #:defaults ([default-bito #f]))
         field-clause ...)
 
-     ;; Parse field clauses: (name type width-stx byte-order-or-#f unit-or-#f compute-or-#f)
-     ;; Parse field clauses: 7-element list
-     ;; (name type width-stx byte-order-or-#f unit-or-#f compute-or-#f contract-or-#f)
+     ;; Parse field clauses: 8-element list
+     ;; (name type width-stx byte-order-or-#f unit-or-#f
+     ;;  bit-order-or-#f compute-or-#f contract-or-#f)
      (define field-infos
        (for/list ([fc (in-list (syntax->list #'(field-clause ...)))])
          (syntax-parse fc
            [(fname:id ftype:id fwidth
                       (~optional (~seq #:byte-order fbo:id))
                       (~optional (~seq #:unit funit:id))
+                      (~optional (~seq #:bit-order fbito:id))
                       (~optional (~seq #:compute fcompute:expr))
                       (~optional (~seq #:contract fcontract:expr)))
             (list #'fname #'ftype #'fwidth
-                  (attribute fbo) (attribute funit)
+                  (attribute fbo) (attribute funit) (attribute fbito)
                   (attribute fcompute) (attribute fcontract))])))
 
      (define field-names  (map first field-infos))
@@ -194,19 +201,41 @@
      ;; Field index for each field
      (define field-indices (range (length field-infos)))
 
+     ;; Resolve effective bit-order for a compile-time field-info
+     (define (info-effective-bit-order info)
+       (define fbi (sixth info))
+       (define proto-bito (attribute default-bito))
+       (cond
+         [fbi (syntax-e fbi)]
+         [proto-bito (syntax-e proto-bito)]
+         [else 'msb]))
+
+     ;; Collect a compile-time bitfield group (split on bit-order change)
+     (define (collect-static-bitfield-group infos)
+       (define (effective-bo info) (info-effective-bit-order info))
+       (let loop ([is infos] [group '()] [bits 0] [group-bo #f])
+         (cond
+           [(and (pair? is)
+                 (bitfield? (car is))
+                 (or (not group-bo)
+                     (eq? group-bo (effective-bo (car is)))))
+            (define i (car is))
+            (loop (cdr is) (cons i group)
+                  (+ bits (syntax-e (third i)))
+                  (or group-bo (effective-bo i)))]
+           [else
+            (values (reverse group) bits (or group-bo 'msb) is)])))
+
      ;; Compute static accessor infos (only used when no variable fields)
      (define static-accessor-infos
        (if has-variable-fields?
            #f  ;; will use boundaries at runtime
-           (let loop ([infos field-infos] [byte-off 0] [bit-acc 0] [acc '()])
+           (let loop ([infos field-infos] [byte-off 0] [acc '()])
              (cond
                [(null? infos) acc]
                [(bitfield? (car infos))
-                (define-values (group group-bits remaining)
-                  (let grp ([is infos] [g '()] [bits 0])
-                    (if (and (pair? is) (bitfield? (car is)))
-                        (grp (cdr is) (cons (car is) g) (+ bits (syntax-e (third (car is)))))
-                        (values (reverse g) bits is))))
+                (define-values (group group-bits group-bo remaining)
+                  (collect-static-bitfield-group infos))
                 (define group-bytes (quotient group-bits 8))
                 (define group-acc
                   (let gloop ([gs group] [bit-pos 0] [gacc '()])
@@ -214,11 +243,11 @@
                         (reverse gacc)
                         (let ([w (syntax-e (third (car gs)))])
                           (gloop (cdr gs) (+ bit-pos w)
-                                 (cons (list 'bits byte-off group-bytes bit-pos w) gacc))))))
-                (loop remaining (+ byte-off group-bytes) 0 (append acc group-acc))]
+                                 (cons (list 'bits byte-off group-bytes bit-pos w group-bo) gacc))))))
+                (loop remaining (+ byte-off group-bytes) (append acc group-acc))]
                [else
                 (define w (syntax-e (third (car infos))))
-                (loop (cdr infos) (+ byte-off w) 0
+                (loop (cdr infos) (+ byte-off w)
                       (append acc (list (list 'byte byte-off))))]))))
 
      ;; Keywords from field names
@@ -256,7 +285,7 @@
 
      ;; Field descriptor expressions
      (define (field-computed? info)
-       (and (sixth info) #t))
+       (and (seventh info) #t))
 
      (define fd-exprs
        (for/list ([info field-infos])
@@ -265,13 +294,18 @@
          (define fw-stx (third info))
          (define fb (fourth info))
          (define fu (fifth info))
-         (define fc (sixth info))
-         (define fk (seventh info))
+         (define fbi (sixth info))   ;; bit-order
+         (define fc (seventh info))  ;; compute
+         (define fk (eighth info))   ;; contract
          (define bo-expr (if fb #`'#,fb #`'default-bo))
          (define width-arg (width-stx->expr fw-stx))
+         ;; Resolve effective bit-order for this field
+         (define effective-bito
+           (or fbi (and (attribute default-bito) #'default-bito)))
          ;; Build optional keyword args
          (define kw-args
            (append (if fu (list #'#:unit #`'#,fu) '())
+                   (if effective-bito (list #'#:bit-order #`'#,effective-bito) '())
                    (if fc (list #'#:compute fc) '())
                    (if fk (list #'#:contract fk) '())))
          #`(make-field-desc '#,fn '#,ft #,width-arg #,bo-expr #,@kw-args)))
@@ -320,7 +354,8 @@
                     (decode-bitfield (#,inst-bytes v)
                                     (second bounds) (third bounds)
                                     (fourth bounds) (fifth bounds)
-                                    '#,ft)])))
+                                    '#,ft
+                                    #:bit-order (sixth bounds))])))
            ;; Static accessors (compile-time offsets)
            (for/list ([aid accessor-ids]
                       [fn field-names]
@@ -339,13 +374,15 @@
                 (define group-bytes (third ai))
                 (define bit-offset (fourth ai))
                 (define bit-width (fifth ai))
+                (define bit-ord (sixth ai))
                 #`(define (#,aid v)
                     (decode-bitfield (#,inst-bytes v)
                                      (+ (#,inst-offset v) #,group-byte-off)
                                      #,group-bytes
                                      #,bit-offset
                                      #,bit-width
-                                     '#,ft))]))))
+                                     '#,ft
+                                     #:bit-order '#,(datum->syntax #'sname bit-ord)))]))))
 
      ;; Accessor table for match expander
      (define accessor-table-for-match

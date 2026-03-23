@@ -162,15 +162,19 @@
         field-clause ...)
 
      ;; Parse field clauses: (name type width-stx byte-order-or-#f unit-or-#f compute-or-#f)
+     ;; Parse field clauses: 7-element list
+     ;; (name type width-stx byte-order-or-#f unit-or-#f compute-or-#f contract-or-#f)
      (define field-infos
        (for/list ([fc (in-list (syntax->list #'(field-clause ...)))])
          (syntax-parse fc
            [(fname:id ftype:id fwidth
                       (~optional (~seq #:byte-order fbo:id))
                       (~optional (~seq #:unit funit:id))
-                      (~optional (~seq #:compute fcompute:expr)))
+                      (~optional (~seq #:compute fcompute:expr))
+                      (~optional (~seq #:contract fcontract:expr)))
             (list #'fname #'ftype #'fwidth
-                  (attribute fbo) (attribute funit) (attribute fcompute))])))
+                  (attribute fbo) (attribute funit)
+                  (attribute fcompute) (attribute fcontract))])))
 
      (define field-names  (map first field-infos))
      (define field-widths (map third field-infos))
@@ -262,20 +266,15 @@
          (define fb (fourth info))
          (define fu (fifth info))
          (define fc (sixth info))
+         (define fk (seventh info))
          (define bo-expr (if fb #`'#,fb #`'default-bo))
          (define width-arg (width-stx->expr fw-stx))
-         (define base
-           (if fu
-               #`(make-field-desc '#,fn '#,ft #,width-arg #,bo-expr #:unit '#,fu)
-               #`(make-field-desc '#,fn '#,ft #,width-arg #,bo-expr)))
-         (if fc
-             ;; Add #:compute to the make-field-desc call
-             (if fu
-                 #`(make-field-desc '#,fn '#,ft #,width-arg #,bo-expr
-                                    #:unit '#,fu #:compute #,fc)
-                 #`(make-field-desc '#,fn '#,ft #,width-arg #,bo-expr
-                                    #:compute #,fc))
-             base)))
+         ;; Build optional keyword args
+         (define kw-args
+           (append (if fu (list #'#:unit #`'#,fu) '())
+                   (if fc (list #'#:compute fc) '())
+                   (if fk (list #'#:contract fk) '())))
+         #`(make-field-desc '#,fn '#,ft #,width-arg #,bo-expr #,@kw-args)))
 
      ;; Encode function formals: exclude computed fields from keyword args
      (define encode-sorted-idxs

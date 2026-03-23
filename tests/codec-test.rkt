@@ -432,3 +432,36 @@
                       (make-field-desc 'chk 'uint 1 'big #:compute always-42))))
     (define bs (encode p (hasheq 'val 99 'chk 0)))
     (check-equal? (bytes-ref bs 1) 42)))
+
+;; ===== Contract Validation on Encode =====
+
+(describe "encode (contract validation)"
+  (it "passes when contract is satisfied"
+    (define (port? v) (and (integer? v) (<= 0 v 65535)))
+    (define p (make-protocol-desc 'msg
+                (list (make-field-desc 'port 'uint 2 'big #:contract port?))))
+    (check-not-exn (λ () (encode p (hasheq 'port 80)))))
+
+  (it "raises when contract is violated"
+    (define (port? v) (and (integer? v) (<= 0 v 65535)))
+    (define p (make-protocol-desc 'msg
+                (list (make-field-desc 'port 'uint 2 'big #:contract port?))))
+    (check-exn exn:fail?
+      (λ () (encode p (hasheq 'port 70000)))))
+
+  (it "includes field name in error message"
+    (define (positive? v) (> v 0))
+    (define p (make-protocol-desc 'msg
+                (list (make-field-desc 'count 'uint 1 'big #:contract positive?))))
+    (check-exn #rx"count"
+      (λ () (encode p (hasheq 'count 0)))))
+
+  (it "skips contract check for computed fields"
+    (define (always-valid? v) #f) ;; would fail if checked
+    (define p (make-protocol-desc 'msg
+                (list (make-field-desc 'val 'uint 1 'big)
+                      (make-field-desc 'chk 'uint 1 'big
+                                       #:compute (λ (buf) 42)
+                                       #:contract always-valid?))))
+    ;; Should not raise — computed fields aren't checked at encode time
+    (check-not-exn (λ () (encode p (hasheq 'val 1))))))

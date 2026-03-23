@@ -137,6 +137,22 @@
       (check-exn exn:fail?
         (λ () (make-field-desc 'a 'uint (make-field-ref 'x) 'big #:unit 'bits))))))
 
+(describe "field-desc-contract"
+  (it "defaults to #f (no contract)"
+    (define f (make-field-desc 'val 'uint 4 'big))
+    (check-false (field-desc-contract f)))
+
+  (it "stores a contract predicate when provided"
+    (define f (make-field-desc 'port 'uint 2 'big
+                               #:contract (λ (v) (and (integer? v) (<= 0 v 65535)))))
+    (check-pred procedure? (field-desc-contract f)))
+
+  (it "has-contract? predicate works"
+    (define f1 (make-field-desc 'val 'uint 4 'big))
+    (define f2 (make-field-desc 'port 'uint 2 'big #:contract (λ (v) #t)))
+    (check-false (field-desc-has-contract? f1))
+    (check-true (field-desc-has-contract? f2))))
+
 (describe "field-desc-compute"
   (it "defaults to #f (no compute function)"
     (define f (make-field-desc 'val 'uint 4 'big))

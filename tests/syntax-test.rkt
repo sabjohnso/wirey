@@ -334,3 +334,36 @@
         [(checksummed-msg #:tag t #:chk c)
          (check-equal? t #xAA)
          (check-equal? c #xAD)]))))
+
+;; Test contracts in struct/wire
+(define (valid-port? v) (and (integer? v) (<= 0 v 65535)))
+(define (positive? v) (> v 0))
+
+(struct/wire contracted-msg
+  #:byte-order big
+  (port  uint 2 #:contract valid-port?)
+  (count uint 1 #:contract positive?)
+  (data  uint 1))
+
+(describe "struct/wire with contracts"
+  (context "encoding"
+    (it "succeeds when contracts are satisfied"
+      (check-not-exn
+       (λ () (contracted-msg-encode #:port 80 #:count 5 #:data 0))))
+
+    (it "raises when port contract violated"
+      (check-exn exn:fail?
+        (λ () (contracted-msg-encode #:port 70000 #:count 1 #:data 0))))
+
+    (it "raises when count contract violated"
+      (check-exn exn:fail?
+        (λ () (contracted-msg-encode #:port 80 #:count 0 #:data 0)))))
+
+  (context "decoding"
+    (it "decodes normally regardless of contracts"
+      ;; Decode always works — contracts are encode-time only by default
+      (define bs (bytes #x00 #x50 #x03 #xFF))
+      (define v (contracted-msg-decode bs))
+      (check-equal? (contracted-msg-port v) 80)
+      (check-equal? (contracted-msg-count v) 3)
+      (check-equal? (contracted-msg-data v) #xFF))))

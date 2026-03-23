@@ -31,6 +31,17 @@
       (if (field-desc-computed? f)
           (hash-set v (field-desc-name f) 0)
           v)))
+  ;; Validate contracts on non-computed fields
+  (for ([f (in-list fields)])
+    (when (and (field-desc-has-contract? f)
+               (not (field-desc-computed? f)))
+      (define name (field-desc-name f))
+      (define val (hash-ref effective-values name))
+      (define contract-fn (field-desc-contract f))
+      (unless (contract-fn val)
+        (error 'encode
+               "field '~a': contract violation, value ~e rejected"
+               name val))))
   ;; Compute total size by resolving all widths
   (define total
     (let loop ([fields fields] [bit-acc 0] [total 0])

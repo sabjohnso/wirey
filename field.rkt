@@ -14,6 +14,8 @@
          field-desc-unit
          field-desc-compute
          field-desc-computed?
+         field-desc-contract
+         field-desc-has-contract?
          field-desc-width-in-bits
          field-desc-variable-length?)
 
@@ -39,13 +41,14 @@
 (define (bitfield-type? v)
   (memq v '(uint sint)))
 
-;; Internal struct — 6th field is the optional compute function
-(struct field-desc (name type width byte-order unit compute) #:transparent)
+;; Internal struct — 6th field is compute, 7th is contract
+(struct field-desc (name type width byte-order unit compute contract) #:transparent)
 
 ;; Validated constructor
 (define (make-field-desc name type width byte-order
                          #:unit [unit 'bytes]
-                         #:compute [compute-fn #f])
+                         #:compute [compute-fn #f]
+                         #:contract [contract-fn #f])
   (unless (symbol? name)
     (error 'make-field-desc "name must be a symbol, got: ~e" name))
   (unless (field-type? type)
@@ -66,11 +69,17 @@
            "bit-unit fields must have fixed width, got: ~e" width))
   (when (and compute-fn (not (procedure? compute-fn)))
     (error 'make-field-desc "#:compute must be a procedure, got: ~e" compute-fn))
-  (field-desc name type width byte-order unit compute-fn))
+  (when (and contract-fn (not (procedure? contract-fn)))
+    (error 'make-field-desc "#:contract must be a procedure, got: ~e" contract-fn))
+  (field-desc name type width byte-order unit compute-fn contract-fn))
 
 ;; Is this a computed field?
 (define (field-desc-computed? fd)
   (and (field-desc-compute fd) #t))
+
+;; Does this field have a contract?
+(define (field-desc-has-contract? fd)
+  (and (field-desc-contract fd) #t))
 
 ;; Is this a variable-length field?
 (define (field-desc-variable-length? fd)

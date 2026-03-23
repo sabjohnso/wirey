@@ -1,3 +1,4 @@
 wirey
 =====
-README text here.
+
+Binary wire protocol specifications

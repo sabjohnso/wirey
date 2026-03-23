@@ -10,7 +10,8 @@
          wirey/protocol
          wirey/codec
          wirey/length-expr
-         wirey/enum)
+         wirey/enum
+         wirey/case-block)
 
 (provide struct/wire)
 
@@ -182,36 +183,65 @@
      ;; Parse field clauses: 9-element list
      ;; (name type width-stx byte-order-or-#f unit-or-#f
      ;;  bit-order-or-#f compute-or-#f contract-or-#f align-or-#f)
+     ;; Parse a single normal field clause into a 12-element info list.
+     (define (parse-normal-field fc)
+       (syntax-parse fc
+         ;; Padding with #:align — no explicit width
+         [(fname:id ftype:id #:align falign:nat)
+          #:when (eq? (syntax-e #'ftype) 'padding)
+          (list #'fname #'ftype #f
+                #f #f #f #f #f (syntax-e #'falign) #f #f #f)]
+         ;; Embedded struct field
+         [(fname:id fstruct:id #:struct)
+          (list #'fname (list 'embedded #'fstruct) #f
+                #f #f #f #f #f #f #f #f #f)]
+         ;; Normal field clause
+         [(fname:id ftype:id fwidth
+                    (~optional (~seq #:byte-order fbo:id))
+                    (~optional (~seq #:unit funit:id))
+                    (~optional (~seq #:bit-order fbito:id))
+                    (~optional (~seq #:compute fcompute:expr))
+                    (~optional (~seq #:contract fcontract:expr))
+                    (~optional (~seq #:present-when fpresent:expr))
+                    (~optional (~seq #:default fdefault:expr))
+                    (~optional (~seq #:enum fenum:expr)))
+          (list #'fname #'ftype #'fwidth
+                (attribute fbo) (attribute funit) (attribute fbito)
+                (attribute fcompute) (attribute fcontract) #f
+                (attribute fpresent) (attribute fdefault)
+                (attribute fenum))]))
+
+     ;; Parse field clauses, recognizing #:case blocks.
+     ;; Returns a list of items — each is either:
+     ;;   - A 12-element field-info list (for normal fields)
+     ;;   - A (list 'case-block disc-name-stx branches) where each branch is
+     ;;     (list pred-or-val-stx (listof field-info))
      (define raw-field-infos
-       (for/list ([fc (in-list (syntax->list #'(field-clause ...)))])
-         (syntax-parse fc
-           ;; Padding with #:align — no explicit width
-           [(fname:id ftype:id #:align falign:nat)
-            #:when (eq? (syntax-e #'ftype) 'padding)
-            (list #'fname #'ftype #f
-                  #f #f #f #f #f (syntax-e #'falign) #f #f #f)]
-           ;; Embedded struct field
-           [(fname:id fstruct:id #:struct)
-            ;; Store the struct name in a special marker.
-            ;; Width will be resolved later. Type is 'octets at codec level.
-            ;; We use a list marker ('embedded struct-name) in the type position.
-            (list #'fname (list 'embedded #'fstruct) #f
-                  #f #f #f #f #f #f #f #f #f)]
-           ;; Normal field clause
-           [(fname:id ftype:id fwidth
-                      (~optional (~seq #:byte-order fbo:id))
-                      (~optional (~seq #:unit funit:id))
-                      (~optional (~seq #:bit-order fbito:id))
-                      (~optional (~seq #:compute fcompute:expr))
-                      (~optional (~seq #:contract fcontract:expr))
-                      (~optional (~seq #:present-when fpresent:expr))
-                      (~optional (~seq #:default fdefault:expr))
-                      (~optional (~seq #:enum fenum:expr)))
-            (list #'fname #'ftype #'fwidth
-                  (attribute fbo) (attribute funit) (attribute fbito)
-                  (attribute fcompute) (attribute fcontract) #f
-                  (attribute fpresent) (attribute fdefault)
-                  (attribute fenum))])))
+       (let loop ([clauses (syntax->list #'(field-clause ...))] [acc '()])
+         (cond
+           [(null? clauses) (reverse acc)]
+           [else
+            (define fc (car clauses))
+            (syntax-parse fc
+              ;; Case block: (#:case disc-field [pred fields...] ...)
+              [(#:case disc:id branch ...)
+               (define branches
+                 (for/list ([br (in-list (syntax->list #'(branch ...)))])
+                   (syntax-parse br
+                     [((pred-or-val) inner-field ...)
+                      (define inner-infos
+                        (for/list ([inf (in-list (syntax->list #'(inner-field ...)))])
+                          (parse-normal-field inf)))
+                      (list #'pred-or-val inner-infos)])))
+               (loop (cdr clauses)
+                     (cons (list 'case-block #'disc branches) acc))]
+              ;; Normal field
+              [_
+               (loop (cdr clauses) (cons (parse-normal-field fc) acc))])])))
+
+     ;; Check if a raw-field-info item is a case-block entry
+     (define (case-block-entry? item)
+       (and (pair? item) (eq? (car item) 'case-block)))
 
      ;; If #:alignment is set, insert auto-alignment padding before each
      ;; non-first, non-padding field.
@@ -222,6 +252,7 @@
                (cond
                  [(null? infos) (reverse acc)]
                  [(and (not first?)
+                       (not (case-block-entry? (car infos)))
                        (not (eq? (syntax-e (second (car infos))) 'padding)))
                   ;; Insert an auto-align padding entry before this field
                   (define pad-name (datum->syntax (first (car infos))
@@ -243,6 +274,9 @@
          (cond
            [(null? infos)
             (reverse acc)]
+           ;; Case blocks: pass through unchanged
+           [(case-block-entry? (car infos))
+            (loop (cdr infos) byte-off bit-acc (cons (car infos) acc))]
            ;; Auto-align padding: compute width from current offset
            [(ninth (car infos))
             (define info (car infos))
@@ -291,20 +325,53 @@
             (define w (if (third info) (if (nat-stx? (third info)) (syntax-e (third info)) 0) 0))
             (loop (cdr infos) (+ byte-off flush-bytes w) 0 (cons info acc))])))
 
-     (define field-names  (map first field-infos))
-     (define field-widths (map third field-infos))
+     ;; Separate normal field-infos from case blocks.
+     ;; Flatten all field names (including case branch fields) for accessor/keyword generation.
+     (define normal-field-infos
+       (filter (λ (i) (not (case-block-entry? i))) field-infos))
+
+     ;; All case-block entries
+     (define case-block-entries
+       (filter case-block-entry? field-infos))
+
+     ;; Collect all field-infos from case branches (for accessor/keyword generation)
+     (define case-branch-field-infos
+       (apply append
+              (for/list ([cb case-block-entries])
+                (apply append
+                       (for/list ([br (third cb)])
+                         (second br))))))
+
+     ;; All field infos (normal + case branch) for accessor/keyword purposes
+     ;; Deduplicate by field name (same name in multiple branches → keep first)
+     (define all-field-infos
+       (let loop ([infos (append normal-field-infos case-branch-field-infos)]
+                  [seen '()] [acc '()])
+         (cond
+           [(null? infos) (reverse acc)]
+           [(memq (syntax-e (first (car infos))) seen)
+            (loop (cdr infos) seen acc)]
+           [else
+            (loop (cdr infos)
+                  (cons (syntax-e (first (car infos))) seen)
+                  (cons (car infos) acc))])))
+
+     ;; Use all-field-infos for name/keyword extraction
+     (define field-names  (map first all-field-infos))
 
      ;; Determine if a field has a variable-length width (not a literal nat)
      (define (variable-width? info)
        (define w (third info))
-       (not (let ([v (syntax-e w)]) (and (integer? v) (exact? v) (>= v 0)))))
+       (and w (not (let ([v (syntax-e w)]) (and (integer? v) (exact? v) (>= v 0))))))
 
      (define (field-conditional? info)
-       (and (tenth info) #t))
+       (and (>= (length info) 10) (tenth info) #t))
 
+     ;; Case blocks always make the protocol variable-length
      (define has-variable-fields?
-       (ormap (λ (info) (or (variable-width? info) (field-conditional? info)))
-              field-infos))
+       (or (pair? case-block-entries)
+           (ormap (λ (info) (or (variable-width? info) (field-conditional? info)))
+                  normal-field-infos)))
 
      (define (bitfield? info)
        (define u (fifth info))
@@ -397,43 +464,67 @@
 
      ;; Field descriptor expressions
      (define (field-computed? info)
-       (and (seventh info) #t))
+       (and (>= (length info) 7) (seventh info) #t))
 
      (define (field-padding? info)
-       (eq? (syntax-e (second info)) 'padding))
+       (and (not (case-block-entry? info))
+            (eq? (syntax-e (second info)) 'padding)))
 
-     (define fd-exprs
-       (for/list ([info field-infos])
+     ;; Helper: generate a make-field-desc expression from a field-info
+     (define (info->fd-expr info)
          (define fn (first info))
          (define ft (second info))
          (define fw-stx (third info))
          (define fb (fourth info))
          (define fu (fifth info))
-         (define fbi (sixth info))    ;; bit-order
-         (define fc (seventh info))   ;; compute
-         (define fk (eighth info))    ;; contract
-         ;; ninth = align (already resolved)
-         (define fp (tenth info))     ;; present-when
+         (define fbi (sixth info))
+         (define fc (seventh info))
+         (define fk (eighth info))
+         (define fp (tenth info))
          (define bo-expr (if fb #`'#,fb #`'default-bo))
          (define width-arg (width-stx->expr fw-stx))
-         ;; Resolve effective bit-order for this field
          (define effective-bito
            (or fbi (and (attribute default-bito) #'default-bito)))
-         ;; Build optional keyword args
          (define kw-args
            (append (if fu (list #'#:unit #`'#,fu) '())
                    (if effective-bito (list #'#:bit-order #`'#,effective-bito) '())
                    (if fc (list #'#:compute fc) '())
                    (if fk (list #'#:contract fk) '())
                    (if fp (list #'#:present-when fp) '())))
-         #`(make-field-desc '#,fn '#,ft #,width-arg #,bo-expr #,@kw-args)))
+         #`(make-field-desc '#,fn '#,ft #,width-arg #,bo-expr #,@kw-args))
+
+     ;; Protocol field list: mix of make-field-desc and make-case-block exprs
+     (define fd-exprs
+       (for/list ([info field-infos])
+         (if (case-block-entry? info)
+             ;; Generate make-case-block expression
+             (let ([disc-name (second info)]
+                   [branches (third info)])
+               #`(make-case-block '#,disc-name
+                   (list #,@(for/list ([br branches])
+                              (define pred-stx (first br))
+                              (define branch-infos (second br))
+                              #`(make-case-branch
+                                 #,pred-stx
+                                 (list #,@(map info->fd-expr branch-infos)))))))
+             ;; Normal field-desc
+             (info->fd-expr info))))
+
+     ;; Track which all-field-infos indices are from case branches (always optional)
+     (define case-branch-field-indices
+       (let ([n (length normal-field-infos)])
+         (for/list ([i (in-range n (length all-field-infos))])
+           i)))
+
+     (define (case-branch-field? idx)
+       (memv idx case-branch-field-indices))
 
      ;; Encode function formals: exclude computed and padding fields from keyword args
      (define (field-has-default? info)
        (and (>= (length info) 11) (list-ref info 10) #t))
 
      (define encode-sorted-idxs
-       (filter (λ (i) (define info (list-ref field-infos i))
+       (filter (λ (i) (define info (list-ref all-field-infos i))
                        (not (or (field-computed? info) (field-padding? info))))
                sorted-idxs))
 
@@ -447,20 +538,25 @@
        (apply append
               (for/list ([i encode-sorted-idxs]
                          [param encode-sorted-params])
-                (define info (list-ref field-infos i))
+                (define info (list-ref all-field-infos i))
                 (define kw (datum->syntax #'sname (list-ref field-kws i)))
-                (if (field-has-default? info)
-                    (list kw (list param (list-ref info 10)))
-                    (list kw param)))))
+                (cond
+                  [(case-branch-field? i)
+                   ;; Case branch fields are always optional with default #f
+                   (list kw (list param #'#f))]
+                  [(field-has-default? info)
+                   (list kw (list param (list-ref info 10)))]
+                  [else
+                   (list kw param)]))))
 
      (define encode-hash-pairs
        (apply append
               (for/list ([i encode-sorted-idxs]
                          [param encode-sorted-params])
                 (define fn (list-ref field-names i))
-                (define info (list-ref field-infos i))
-                (define fenum (list-ref info 11))
-                (if (and fenum (not (pair? fenum)))  ;; skip embedded-struct markers
+                (define info (list-ref all-field-infos i))
+                (define fenum (and (>= (length info) 12) (list-ref info 11)))
+                (if (and fenum (not (pair? fenum)))
                     (list #`'#,fn #`(wire-enum-ref #,fenum #,param))
                     (list #`'#,fn param)))))
 
@@ -494,77 +590,97 @@
      (define (wrap-accessor info body-expr)
        (maybe-wrap-enum info (maybe-wrap-embedded info body-expr)))
 
-     ;; Accessor definitions (skip padding fields)
+     ;; Generate accessor defs for case-block protocols (decode + hash-ref)
+     (define (make-case-accessor-defs)
+       (for/list ([aid accessor-ids]
+                  [fn field-names]
+                  [info all-field-infos]
+                  #:unless (field-padding? info))
+         #`(define (#,aid v)
+             (define decoded (decode #,desc-id (#,inst-bytes v)
+                                    #:offset (#,inst-offset v)))
+             (define raw-val (hash-ref decoded '#,fn #f))
+             #,(wrap-accessor info #'raw-val))))
+
+     ;; Generate accessor defs for dynamic (variable-length, no case blocks)
+     (define (make-dynamic-accessor-defs)
+       (for/list ([aid accessor-ids]
+                  [fn field-names]
+                  [info all-field-infos]
+                  [idx (range (length all-field-infos))]
+                  #:unless (field-padding? info))
+         (define ft (second info))
+         #`(define (#,aid v)
+             (define bounds (vector-ref (#,inst-bounds v) #,idx))
+             (define raw-val
+               (case (car bounds)
+                 [(absent) #f]
+                 [(byte)
+                  (decode-field (#,inst-bytes v) (second bounds)
+                               (make-field-desc '#,fn '#,ft (third bounds)
+                                                (field-desc-byte-order
+                                                 (list-ref (protocol-desc-fields #,desc-id) #,idx))))]
+                 [(bits)
+                  (decode-bitfield (#,inst-bytes v)
+                                  (second bounds) (third bounds)
+                                  (fourth bounds) (fifth bounds)
+                                  '#,ft
+                                  #:bit-order (sixth bounds))]))
+             #,(wrap-accessor info #'raw-val))))
+
+     ;; Generate accessor defs for static (fixed-width, no case blocks)
+     (define (make-static-accessor-defs)
+       (for/list ([aid accessor-ids]
+                  [fn field-names]
+                  [info all-field-infos]
+                  [ai static-accessor-infos]
+                  #:unless (field-padding? info))
+         (define ft (second info))
+         (case (car ai)
+           [(byte)
+            (define byte-off (second ai))
+            #`(define (#,aid v)
+                (define raw-val
+                  (decode-field (#,inst-bytes v)
+                                (+ (#,inst-offset v) #,byte-off)
+                                (protocol-desc-field-ref #,desc-id '#,fn)))
+                #,(wrap-accessor info #'raw-val))]
+           [(bits)
+            (define group-byte-off (second ai))
+            (define group-bytes (third ai))
+            (define bit-offset (fourth ai))
+            (define bit-width (fifth ai))
+            (define bit-ord (sixth ai))
+            #`(define (#,aid v)
+                (define raw-val
+                  (decode-bitfield (#,inst-bytes v)
+                                   (+ (#,inst-offset v) #,group-byte-off)
+                                   #,group-bytes
+                                   #,bit-offset
+                                   #,bit-width
+                                   '#,ft
+                                   #:bit-order '#,(datum->syntax #'sname bit-ord)))
+                #,(wrap-accessor info #'raw-val))])))
+
+     ;; Select accessor strategy
      (define accessor-defs
-       (if has-variable-fields?
-           ;; Dynamic accessors using precomputed boundaries
-           (for/list ([aid accessor-ids]
-                      [fn field-names]
-                      [info field-infos]
-                      [idx field-indices]
-                      #:unless (field-padding? info))
-             (define ft (second info))
-             #`(define (#,aid v)
-                 (define bounds (vector-ref (#,inst-bounds v) #,idx))
-                 (define raw-val
-                   (case (car bounds)
-                     [(absent) #f]
-                     [(byte)
-                      (decode-field (#,inst-bytes v) (second bounds)
-                                   (make-field-desc '#,fn '#,ft (third bounds)
-                                                    (field-desc-byte-order
-                                                     (list-ref (protocol-desc-fields #,desc-id) #,idx))))]
-                     [(bits)
-                      (decode-bitfield (#,inst-bytes v)
-                                      (second bounds) (third bounds)
-                                      (fourth bounds) (fifth bounds)
-                                      '#,ft
-                                      #:bit-order (sixth bounds))]))
-                 #,(wrap-accessor info #'raw-val)))
-           ;; Static accessors (compile-time offsets)
-           (for/list ([aid accessor-ids]
-                      [fn field-names]
-                      [info field-infos]
-                      [ai static-accessor-infos]
-                      #:unless (field-padding? info))
-             (define ft (second info))
-             (case (car ai)
-               [(byte)
-                (define byte-off (second ai))
-                #`(define (#,aid v)
-                    (define raw-val
-                      (decode-field (#,inst-bytes v)
-                                    (+ (#,inst-offset v) #,byte-off)
-                                    (protocol-desc-field-ref #,desc-id '#,fn)))
-                    #,(wrap-accessor info #'raw-val))]
-               [(bits)
-                (define group-byte-off (second ai))
-                (define group-bytes (third ai))
-                (define bit-offset (fourth ai))
-                (define bit-width (fifth ai))
-                (define bit-ord (sixth ai))
-                #`(define (#,aid v)
-                    (define raw-val
-                      (decode-bitfield (#,inst-bytes v)
-                                       (+ (#,inst-offset v) #,group-byte-off)
-                                       #,group-bytes
-                                       #,bit-offset
-                                       #,bit-width
-                                       '#,ft
-                                       #:bit-order '#,(datum->syntax #'sname bit-ord)))
-                    #,(wrap-accessor info #'raw-val))]))))
+       (cond
+         [(pair? case-block-entries) (make-case-accessor-defs)]
+         [has-variable-fields? (make-dynamic-accessor-defs)]
+         [else (make-static-accessor-defs)]))
+
 
      ;; Accessor table for match expander (skip padding)
      (define accessor-table-for-match
        (for/list ([fn field-names]
                   [aid accessor-ids]
-                  [info field-infos]
+                  [info all-field-infos]
                   #:unless (field-padding? info))
          (cons (symbol->string (syntax-e fn)) aid)))
 
      #`(begin
          ;; Instance struct
-         #,(if has-variable-fields?
+         #,(if (and has-variable-fields? (not (pair? case-block-entries)))
                #`(struct #,instance-id (bytes offset boundaries))
                #`(struct #,instance-id (bytes offset)))
 
@@ -583,12 +699,18 @@
            (encode #,desc-id (hasheq #,@encode-hash-pairs)))
 
          ;; Decode: bytes [#:offset n] → instance
-         #,(if has-variable-fields?
-               #`(define (#,decode-id data #:offset [offset 0])
-                   (define bounds (compute-field-boundaries #,desc-id data offset))
-                   (#,instance-id data offset bounds))
-               #`(define (#,decode-id data #:offset [offset 0])
-                   (#,instance-id data offset)))
+         #,(cond
+             [(pair? case-block-entries)
+              ;; Case-block protocols: no boundaries needed (accessors use full decode)
+              #`(define (#,decode-id data #:offset [offset 0])
+                  (#,instance-id data offset))]
+             [has-variable-fields?
+              #`(define (#,decode-id data #:offset [offset 0])
+                  (define bounds (compute-field-boundaries #,desc-id data offset))
+                  (#,instance-id data offset bounds))]
+             [else
+              #`(define (#,decode-id data #:offset [offset 0])
+                  (#,instance-id data offset))])
 
          ;; Match expander + expression transformer
          (define-match-expander sname

@@ -8,7 +8,8 @@
          wirey/syntax
          wirey/length-expr
          wirey/checksum
-         wirey/enum)
+         wirey/enum
+         wirey/case-block)
 
 ;; -- helpers --
 (define (hex->bytes str)
@@ -600,3 +601,79 @@
     (check-equal? (auto-aligned-msg-value v) #x01020304)
     (check-equal? (auto-aligned-msg-short v) #x0506)
     (check-equal? (auto-aligned-msg-data v) #x0708090A)))
+
+;; Test #:case in struct/wire
+(struct/wire case-msg
+  #:byte-order big
+  (tag uint 1)
+  (#:case tag
+    [(1) (val-u8  uint 1)]
+    [(2) (val-u16 uint 2)]
+    [(3) (x uint 1) (y uint 1)]))
+
+(describe "struct/wire with #:case"
+  (context "encoding"
+    (it "encodes the 1-byte branch"
+      (define bs (case-msg-encode #:tag 1 #:val-u8 #xAA))
+      (check-equal? bs (bytes 1 #xAA)))
+
+    (it "encodes the 2-byte branch"
+      (define bs (case-msg-encode #:tag 2 #:val-u16 #xBBCC))
+      (check-equal? bs (bytes 2 #xBB #xCC)))
+
+    (it "encodes the multi-field branch"
+      (define bs (case-msg-encode #:tag 3 #:x 10 #:y 20))
+      (check-equal? bs (bytes 3 10 20))))
+
+  (context "decoding"
+    (it "decodes the 1-byte branch"
+      (define v (case-msg-decode (bytes 1 #xAA)))
+      (check-equal? (case-msg-tag v) 1)
+      (check-equal? (case-msg-val-u8 v) #xAA))
+
+    (it "decodes the 2-byte branch"
+      (define v (case-msg-decode (bytes 2 #xBB #xCC)))
+      (check-equal? (case-msg-tag v) 2)
+      (check-equal? (case-msg-val-u16 v) #xBBCC))
+
+    (it "returns #f for fields in inactive branches"
+      (define v (case-msg-decode (bytes 1 #xAA)))
+      (check-equal? (case-msg-val-u16 v) #f)
+      (check-equal? (case-msg-x v) #f)))
+
+  (context "match"
+    (it "matches active branch fields"
+      (define v (case-msg-decode (bytes 2 #x12 #x34)))
+      (match v
+        [(case-msg #:tag t #:val-u16 val)
+         (check-equal? t 2)
+         (check-equal? val #x1234)]))))
+
+;; Test #:case with predicate branches
+(struct/wire cbor-like
+  #:byte-order big
+  (info uint 1)
+  (#:case info
+    [((λ (v) (<= v 23)))]
+    [(24) (ext-val uint 1)]
+    [(25) (ext-val uint 2)]
+    [(26) (ext-val uint 4)]))
+
+(describe "struct/wire with #:case predicate branches"
+  (it "matches predicate (inline, no extra fields)"
+    (define bs (cbor-like-encode #:info 5))
+    (check-equal? bs (bytes 5))
+    (define v (cbor-like-decode bs))
+    (check-equal? (cbor-like-info v) 5)
+    (check-equal? (cbor-like-ext-val v) #f))
+
+  (it "matches exact value (1-byte ext)"
+    (define bs (cbor-like-encode #:info 24 #:ext-val #xFF))
+    (check-equal? bs (bytes 24 #xFF))
+    (define v (cbor-like-decode bs))
+    (check-equal? (cbor-like-ext-val v) #xFF))
+
+  (it "matches exact value (4-byte ext)"
+    (define bs (cbor-like-encode #:info 26 #:ext-val #xDEADBEEF))
+    (define v (cbor-like-decode bs))
+    (check-equal? (cbor-like-ext-val v) #xDEADBEEF)))

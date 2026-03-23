@@ -2,7 +2,8 @@
 
 (require wirey/field
          wirey/protocol
-         wirey/length-expr)
+         wirey/length-expr
+         wirey/case-block)
 
 (provide encode
          decode
@@ -29,7 +30,8 @@
   (define fields (protocol-desc-fields pd))
   ;; For computed and padding fields, use 0 as placeholder in values
   (define effective-values
-    (for/fold ([v values]) ([f (in-list fields)])
+    (for/fold ([v values]) ([f (in-list fields)]
+                            #:when (field-desc? f))
       (if (or (field-desc-computed? f)
               (eq? (field-desc-type f) 'padding))
           (hash-set v (field-desc-name f) 0)
@@ -40,7 +42,8 @@
     (or (not pw)
         (pw (λ (name) (hash-ref effective-values name)))))
   ;; Validate contracts on non-computed, non-padding, present fields
-  (for ([f (in-list fields)])
+  (for ([f (in-list fields)]
+        #:when (field-desc? f))
     (when (and (field-desc-has-contract? f)
                (not (field-desc-computed? f))
                (not (eq? (field-desc-type f) 'padding))
@@ -58,6 +61,18 @@
       (cond
         [(null? fields)
          (+ total (quotient bit-acc 8))]
+        ;; Case block
+        [(case-block? (car fields))
+         (define flush (if (zero? bit-acc) 0 (quotient bit-acc 8)))
+         (define cb (car fields))
+         (define disc-val (hash-ref effective-values (case-block-discriminator cb)))
+         (define br (case-block-select-branch cb disc-val))
+         (define branch-size
+           (if br
+               (for/sum ([bf (in-list (case-branch-fields br))])
+                 (field-desc-width bf))
+               0))
+         (loop (cdr fields) 0 (+ total flush branch-size))]
         [(and (field-desc-conditional? (car fields))
               (not (field-present? (car fields))))
          (loop (cdr fields) bit-acc total)]
@@ -71,7 +86,6 @@
          (define rep-until (field-desc-repeat-until f))
          (define count (cond
                          [rep-until
-                          ;; Items + 1 for sentinel
                           (+ 1 (length (hash-ref effective-values (field-desc-name f))))]
                          [(not rep) 1]
                          [(exact-positive-integer? rep) rep]
@@ -83,8 +97,25 @@
   (let loop ([fields fields] [byte-off 0])
     (cond
       [(null? fields) (void)]
+      ;; Case block: encode the matching branch
+      [(case-block? (car fields))
+       (define cb (car fields))
+       (define disc-val (hash-ref effective-values (case-block-discriminator cb)))
+       (define br (case-block-select-branch cb disc-val))
+       (define new-off
+         (if br
+             (let inner-loop ([bfs (case-branch-fields br)] [off byte-off])
+               (if (null? bfs)
+                   off
+                   (let ([bf (car bfs)])
+                     (define w (field-desc-width bf))
+                     (encode-field! buf off bf w (hash-ref effective-values (field-desc-name bf)))
+                     (inner-loop (cdr bfs) (+ off w)))))
+             byte-off))
+       (loop (cdr fields) new-off)]
       ;; Skip absent conditional fields
-      [(and (field-desc-conditional? (car fields))
+      [(and (field-desc? (car fields))
+            (field-desc-conditional? (car fields))
             (not (field-present? (car fields))))
        (loop (cdr fields) byte-off)]
       [(eq? (field-desc-unit (car fields)) 'bits)
@@ -264,8 +295,25 @@
     (cond
       [(null? fields)
        result]
+      ;; Case block: dispatch on discriminator, decode matching branch
+      [(case-block? (car fields))
+       (define cb (car fields))
+       (define disc-val (hash-ref result (case-block-discriminator cb)))
+       (define br (case-block-select-branch cb disc-val))
+       (define-values (new-result new-off)
+         (if br
+             (let inner ([bfs (case-branch-fields br)] [off byte-off] [res result])
+               (if (null? bfs)
+                   (values res off)
+                   (let* ([bf (car bfs)]
+                          [w (field-desc-width bf)]
+                          [val (decode-field-with-width data off bf w)])
+                     (inner (cdr bfs) (+ off w)
+                            (hash-set res (field-desc-name bf) val)))))
+             (values result byte-off)))
+       (loop (cdr fields) new-off 0 new-result)]
       ;; Conditional field: check presence predicate
-      [(field-desc-conditional? (car fields))
+      [(and (field-desc? (car fields)) (field-desc-conditional? (car fields)))
        (define f (car fields))
        (define pw (field-desc-present-when f))
        (if (pw (λ (name) (hash-ref result name)))

@@ -531,20 +531,11 @@ NASDAQ TotalView-ITCH 5.0 messages (big-endian):
 @racket[ethernet/ip-stack] — Ethernet → IPv4 → TCP/UDP.
 
 @; ------------------------------------------------------------------
-@section{Scope and Limitations}
+@section{Scope}
 
-Wirey targets @bold{fixed-layout and semi-fixed-layout} binary protocols:
-formats where the structure is determined by header fields and can be
-described as a flat sequence of fields with conditional presence,
-variable lengths, and dispatch tables.
+Wirey aims to be a complete specification language for binary wire
+formats, from simple fixed-layout protocols (ITCH, Ethernet, PCAP) to
+complex self-describing formats (CBOR, ASN.1 BER, Protocol Buffers).
 
-Wirey @bold{does not} target self-describing recursive formats such as
-CBOR, ASN.1 BER/DER, Protocol Buffers, or MessagePack. These formats
-require recursive type definitions, N-way conditional structures within
-a single message, and variable-width self-describing integer encodings
-that are beyond wirey's flat field model.
-
-Protocols well-suited to wirey include:
-ITCH, FIX/FAST, Ethernet/IPv4/TCP/UDP, PCAP, DNS (headers),
-USB descriptors, Bluetooth HCI, SPI/I2C register maps,
-and most hardware-oriented binary formats.
+Support for recursive types, N-way case dispatch within structs, and
+variable-width self-describing encodings is planned.

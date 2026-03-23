@@ -1,7 +1,8 @@
 #lang racket/base
 
 (require wirey/field
-         wirey/length-expr)
+         wirey/length-expr
+         wirey/case-block)
 
 (provide make-protocol-desc
          protocol-desc?
@@ -46,7 +47,8 @@
 ;; Validate that variable-length fields reference existing earlier fields.
 (define (validate-variable-length-refs fields)
   (define seen '())
-  (for ([f (in-list fields)])
+  (for ([f (in-list fields)]
+        #:when (field-desc? f))
     (define w (field-desc-width f))
     (when (field-ref? w)
       (define ref-name (field-ref-name w))
@@ -83,11 +85,11 @@
   (unless (list? fields)
     (error 'make-protocol-desc "fields must be a list, got: ~e" fields))
   (for ([f (in-list fields)])
-    (unless (field-desc? f)
-      (error 'make-protocol-desc "each field must be a field-desc, got: ~e" f)))
+    (unless (or (field-desc? f) (case-block? f))
+      (error 'make-protocol-desc "each field must be a field-desc or case-block, got: ~e" f)))
   ;; Only validate bitfield groups for fixed-width fields
   (validate-bitfield-groups
-   (filter (λ (f) (not (field-desc-variable-length? f))) fields))
+   (filter (λ (f) (and (field-desc? f) (not (field-desc-variable-length? f)))) fields))
   (validate-variable-length-refs fields)
   (protocol-desc name fields))
 

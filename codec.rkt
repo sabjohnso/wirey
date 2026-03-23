@@ -159,7 +159,13 @@
     [(sint)    (encode-sint! buf offset width order val)]
     [(alpha)   (encode-alpha! buf offset width val)]
     [(octets)  (encode-octets! buf offset width val)]
-    [(padding) (void)]))
+    [(padding) (void)]
+    [(float32) (encode-float! buf offset 4 order val)]
+    [(float64) (encode-float! buf offset 8 order val)]
+    [(bool)    (bytes-set! buf offset (if val 1 0))]
+    [(bcd)     (encode-bcd! buf offset width val)]
+    [(utf8)    (encode-utf8! buf offset width val)]
+    [(utf16)   (encode-utf16! buf offset width order val)]))
 
 (define (encode-uint! buf offset width order val)
   (case order
@@ -187,6 +193,21 @@
 
 (define (encode-octets! buf offset width val)
   (bytes-copy! buf offset val 0 (min (bytes-length val) width)))
+
+(define (encode-float! buf offset size order val)
+  (define big? (eq? order 'big))
+  (define fbs (real->floating-point-bytes val size big?))
+  (bytes-copy! buf offset fbs))
+
+(define (encode-bcd! buf offset width val)
+  ;; Packed BCD: two digits per byte, right-aligned, zero-padded
+  (define digits (* width 2))
+  (define s (number->string val))
+  (define padded (string-append (make-string (max 0 (- digits (string-length s))) #\0) s))
+  (for ([i (in-range width)])
+    (define hi (- (char->integer (string-ref padded (* i 2))) (char->integer #\0)))
+    (define lo (- (char->integer (string-ref padded (+ (* i 2) 1))) (char->integer #\0)))
+    (bytes-set! buf (+ offset i) (bitwise-ior (arithmetic-shift hi 4) lo))))
 
 ;; ============================================================
 ;; Decoding: protocol-desc + bytes + offset → hash
@@ -300,7 +321,13 @@
     [(sint)    (decode-sint data offset width order)]
     [(alpha)   (decode-alpha data offset width)]
     [(octets)  (decode-octets data offset width)]
-    [(padding) (void)]))
+    [(padding) (void)]
+    [(float32) (decode-float data offset 4 order)]
+    [(float64) (decode-float data offset 8 order)]
+    [(bool)    (not (zero? (bytes-ref data offset)))]
+    [(bcd)     (decode-bcd data offset width)]
+    [(utf8)    (decode-utf8 data offset width)]
+    [(utf16)   (decode-utf16 data offset width order)]))
 
 ;; Decode a single field using its own width (byte-unit, fixed-width only)
 (define (decode-field data offset fd)
@@ -355,3 +382,59 @@
 
 (define (string-trim-right s)
   (regexp-replace #rx" +$" s ""))
+
+(define (decode-float data offset size order)
+  (define big? (eq? order 'big))
+  (floating-point-bytes->real (subbytes data offset (+ offset size)) big?))
+
+(define (encode-utf8! buf offset width val)
+  (define src (string->bytes/utf-8 val))
+  (define len (min (bytes-length src) width))
+  (bytes-copy! buf offset src 0 len))
+  ;; remainder is already 0 (null-padded by make-bytes)
+
+(define (decode-utf8 data offset width)
+  (define raw (subbytes data offset (+ offset width)))
+  ;; Trim trailing null bytes
+  (define trimmed
+    (let loop ([end (bytes-length raw)])
+      (if (and (> end 0) (zero? (bytes-ref raw (sub1 end))))
+          (loop (sub1 end))
+          (subbytes raw 0 end))))
+  (bytes->string/utf-8 trimmed))
+
+(define (encode-utf16! buf offset width order val)
+  (define big? (eq? order 'big))
+  (define chars (string->list val))
+  (let loop ([cs chars] [off offset])
+    (when (and (pair? cs) (< (+ off 1) (+ offset width)))
+      (define cp (char->integer (car cs)))
+      (if big?
+          (begin (bytes-set! buf off (arithmetic-shift cp -8))
+                 (bytes-set! buf (+ off 1) (bitwise-and cp #xFF)))
+          (begin (bytes-set! buf off (bitwise-and cp #xFF))
+                 (bytes-set! buf (+ off 1) (arithmetic-shift cp -8))))
+      (loop (cdr cs) (+ off 2)))))
+
+(define (decode-utf16 data offset width order)
+  (define big? (eq? order 'big))
+  (define chars
+    (let loop ([off offset] [acc '()])
+      (if (>= (+ off 1) (+ offset width))
+          (reverse acc)
+          (let ([hi (bytes-ref data off)]
+                [lo (bytes-ref data (+ off 1))])
+            (define cp (if big?
+                           (bitwise-ior (arithmetic-shift hi 8) lo)
+                           (bitwise-ior (arithmetic-shift lo 8) hi)))
+            (if (zero? cp)
+                (reverse acc)  ;; null terminator
+                (loop (+ off 2) (cons (integer->char cp) acc)))))))
+  (apply string chars))
+
+(define (decode-bcd data offset width)
+  (for/fold ([acc 0]) ([i (in-range width)])
+    (define b (bytes-ref data (+ offset i)))
+    (define hi (arithmetic-shift b -4))
+    (define lo (bitwise-and b #x0F))
+    (+ (* acc 100) (* hi 10) lo)))

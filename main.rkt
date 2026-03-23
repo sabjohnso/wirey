@@ -7,7 +7,8 @@
          wirey/length-expr
          wirey/stack
          wirey/dispatch
-         wirey/checksum)
+         wirey/checksum
+         wirey/enum)
 
 (provide (all-from-out wirey/field)
          (all-from-out wirey/protocol)
@@ -16,4 +17,5 @@
          (all-from-out wirey/length-expr)
          (all-from-out wirey/stack)
          (all-from-out wirey/dispatch)
-         (all-from-out wirey/checksum))
+         (all-from-out wirey/checksum)
+         (all-from-out wirey/enum))

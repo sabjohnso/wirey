@@ -526,6 +526,126 @@
     ;; Should not raise — computed fields aren't checked at encode time
     (check-not-exn (λ () (encode p (hasheq 'val 1))))))
 
+;; ===== String Encodings =====
+
+(describe "encode/decode utf8"
+  (it "encodes ASCII string null-padded"
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'name 'utf8 8 'big))))
+    (define bs (encode p (hasheq 'name "hello")))
+    (check-equal? bs (bytes-append #"hello" (bytes 0 0 0))))
+
+  (it "decodes trimming null padding"
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'name 'utf8 8 'big))))
+    (check-equal? (hash-ref (decode p (bytes-append #"hello" (bytes 0 0 0))) 'name)
+                  "hello"))
+
+  (it "round-trips multi-byte characters"
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'name 'utf8 12 'big))))
+    ;; "café" = 5 bytes in UTF-8 (é = 2 bytes)
+    (define v (hasheq 'name "café"))
+    (check-equal? (hash-ref (decode p (encode p v)) 'name) "café")))
+
+(describe "encode/decode utf16"
+  (it "encodes big-endian UTF-16"
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'name 'utf16 8 'big))))
+    ;; "AB" = 0x0041 0x0042 in UTF-16BE, then null-padded
+    (define bs (encode p (hasheq 'name "AB")))
+    (check-equal? (subbytes bs 0 4) (bytes #x00 #x41 #x00 #x42)))
+
+  (it "decodes big-endian UTF-16"
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'name 'utf16 8 'big))))
+    (define bs (bytes #x00 #x41 #x00 #x42 #x00 #x00 #x00 #x00))
+    (check-equal? (hash-ref (decode p bs) 'name) "AB"))
+
+  (it "round-trips"
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'name 'utf16 10 'big))))
+    (define v (hasheq 'name "Test"))
+    (check-equal? (hash-ref (decode p (encode p v)) 'name) "Test")))
+
+;; ===== New Field Types =====
+
+(describe "encode/decode float32"
+  (it "encodes and decodes 1.0 big-endian"
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'val 'float32 4 'big))))
+    (define bs (encode p (hasheq 'val 1.0)))
+    ;; IEEE 754: 1.0 = 3F800000
+    (check-equal? bs (bytes #x3F #x80 #x00 #x00))
+    (define v (decode p bs))
+    (check-equal? (hash-ref v 'val) 1.0))
+
+  (it "encodes and decodes -0.5 little-endian"
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'val 'float32 4 'little))))
+    (define bs (encode p (hasheq 'val -0.5)))
+    (define v (decode p bs))
+    (check-= (hash-ref v 'val) -0.5 1e-7))
+
+  (it "round-trips various values"
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'val 'float32 4 'big))))
+    (for ([x (list 0.0 1.0 -1.0 3.14 1e10 1e-10)])
+      (check-= (hash-ref (decode p (encode p (hasheq 'val x))) 'val) x
+               (* (abs x) 1e-6)))))
+
+(describe "encode/decode float64"
+  (it "encodes and decodes 1.0 big-endian"
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'val 'float64 8 'big))))
+    (define bs (encode p (hasheq 'val 1.0)))
+    (check-equal? bs (bytes #x3F #xF0 #x00 #x00 #x00 #x00 #x00 #x00))
+    (check-equal? (hash-ref (decode p bs) 'val) 1.0))
+
+  (it "round-trips pi"
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'val 'float64 8 'big))))
+    (define v (hasheq 'val 3.141592653589793))
+    (check-equal? (decode p (encode p v)) v)))
+
+(describe "encode/decode bool"
+  (it "encodes #t as 1, #f as 0"
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'flag 'bool 1 'big))))
+    (check-equal? (encode p (hasheq 'flag #t)) (bytes 1))
+    (check-equal? (encode p (hasheq 'flag #f)) (bytes 0)))
+
+  (it "decodes 0 as #f, nonzero as #t"
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'flag 'bool 1 'big))))
+    (check-equal? (hash-ref (decode p (bytes 0)) 'flag) #f)
+    (check-equal? (hash-ref (decode p (bytes 1)) 'flag) #t)
+    (check-equal? (hash-ref (decode p (bytes #xFF)) 'flag) #t)))
+
+(describe "encode/decode bcd"
+  (it "encodes 1234 as packed BCD in 2 bytes"
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'val 'bcd 2 'big))))
+    ;; 1234 → 12 34 (two bytes, two digits per byte)
+    (check-equal? (encode p (hasheq 'val 1234)) (bytes #x12 #x34)))
+
+  (it "decodes packed BCD bytes to integer"
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'val 'bcd 2 'big))))
+    (check-equal? (hash-ref (decode p (bytes #x12 #x34)) 'val) 1234))
+
+  (it "round-trips"
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'val 'bcd 3 'big))))
+    (define v (hasheq 'val 123456))
+    (check-equal? (decode p (encode p v)) v))
+
+  (it "zero-pads small values"
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'val 'bcd 2 'big))))
+    ;; 42 → 00 42
+    (check-equal? (encode p (hasheq 'val 42)) (bytes #x00 #x42))))
+
 ;; ===== Padding and Alignment =====
 
 (describe "encode (padding)"

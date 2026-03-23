@@ -26,7 +26,7 @@
 ;; Valid field types
 (define (field-type? v)
   (and (symbol? v)
-       (memq v '(uint sint alpha octets padding))
+       (memq v '(uint sint alpha octets padding float32 float64 bcd bool utf8 utf16))
        #t))
 
 ;; Valid byte orderings

@@ -187,7 +187,7 @@
            [(fname:id ftype:id #:align falign:nat)
             #:when (eq? (syntax-e #'ftype) 'padding)
             (list #'fname #'ftype #f
-                  #f #f #f #f #f (syntax-e #'falign) #f)]
+                  #f #f #f #f #f (syntax-e #'falign) #f #f)]
            ;; Normal field clause
            [(fname:id ftype:id fwidth
                       (~optional (~seq #:byte-order fbo:id))
@@ -195,11 +195,12 @@
                       (~optional (~seq #:bit-order fbito:id))
                       (~optional (~seq #:compute fcompute:expr))
                       (~optional (~seq #:contract fcontract:expr))
-                      (~optional (~seq #:present-when fpresent:expr)))
+                      (~optional (~seq #:present-when fpresent:expr))
+                      (~optional (~seq #:default fdefault:expr)))
             (list #'fname #'ftype #'fwidth
                   (attribute fbo) (attribute funit) (attribute fbito)
                   (attribute fcompute) (attribute fcontract) #f
-                  (attribute fpresent))])))
+                  (attribute fpresent) (attribute fdefault))])))
 
      ;; Resolve #:align padding widths based on static offsets.
      ;; Walks fields, tracks byte offset, computes padding for #:align fields.
@@ -223,7 +224,7 @@
                 (let ([new-info (list (first info)
                                      (second info)
                                      (datum->syntax (first info) pad-width)
-                                     #f #f #f #f #f #f #f)])
+                                     #f #f #f #f #f #f #f #f)])
                   (loop (cdr infos) (+ cur-off pad-width) 0 (cons new-info acc))))]
            ;; Bitfield: accumulate bits
            [(and (fifth (car infos))
@@ -379,6 +380,9 @@
          #`(make-field-desc '#,fn '#,ft #,width-arg #,bo-expr #,@kw-args)))
 
      ;; Encode function formals: exclude computed and padding fields from keyword args
+     (define (field-has-default? info)
+       (and (>= (length info) 11) (list-ref info 10) #t))
+
      (define encode-sorted-idxs
        (filter (λ (i) (define info (list-ref field-infos i))
                        (not (or (field-computed? info) (field-padding? info))))
@@ -388,12 +392,17 @@
        (for/list ([i encode-sorted-idxs])
          (generate-temporary (list-ref field-names i))))
 
+     ;; Build formals: required kw args first, then optional (with defaults)
+     ;; Actually Racket allows intermixed optional/required in sorted order
      (define encode-formals
        (apply append
               (for/list ([i encode-sorted-idxs]
                          [param encode-sorted-params])
-                (list (datum->syntax #'sname (list-ref field-kws i))
-                      param))))
+                (define info (list-ref field-infos i))
+                (define kw (datum->syntax #'sname (list-ref field-kws i)))
+                (if (field-has-default? info)
+                    (list kw (list param (list-ref info 10)))
+                    (list kw param)))))
 
      (define encode-hash-pairs
        (apply append

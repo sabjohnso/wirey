@@ -16,7 +16,15 @@
     (it "recognizes octets"
       (check-true (field-type? 'octets)))
     (it "recognizes padding"
-      (check-true (field-type? 'padding))))
+      (check-true (field-type? 'padding)))
+    (it "recognizes float32"
+      (check-true (field-type? 'float32)))
+    (it "recognizes float64"
+      (check-true (field-type? 'float64)))
+    (it "recognizes bcd"
+      (check-true (field-type? 'bcd)))
+    (it "recognizes bool"
+      (check-true (field-type? 'bool))))
 
   (context "given invalid values"
     (it "rejects unknown symbols"

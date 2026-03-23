@@ -392,6 +392,27 @@
       (check-equal? (contracted-msg-count v) 3)
       (check-equal? (contracted-msg-data v) #xFF))))
 
+;; Test default values in struct/wire
+(struct/wire defaulted-msg
+  #:byte-order big
+  (version uint 1 #:default 4)
+  (flags   uint 1 #:default 0)
+  (data    uint 2))
+
+(describe "struct/wire with default values"
+  (it "uses defaults when keywords omitted"
+    (define bs (defaulted-msg-encode #:data #x1234))
+    ;; version=4, flags=0, data=0x1234
+    (check-equal? bs (bytes 4 0 #x12 #x34)))
+
+  (it "allows overriding defaults"
+    (define bs (defaulted-msg-encode #:version 6 #:flags #xFF #:data #x1234))
+    (check-equal? bs (bytes 6 #xFF #x12 #x34)))
+
+  (it "allows overriding only some defaults"
+    (define bs (defaulted-msg-encode #:version 5 #:data #xABCD))
+    (check-equal? bs (bytes 5 0 #xAB #xCD))))
+
 ;; Test conditional presence in struct/wire
 (struct/wire conditional-msg
   #:byte-order big

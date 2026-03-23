@@ -4,7 +4,8 @@
          wirey/protocol)
 
 (provide encode
-         decode)
+         decode
+         decode-field)
 
 ;; ============================================================
 ;; Encoding: protocol-desc + hash → bytes

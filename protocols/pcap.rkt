@@ -12,7 +12,7 @@
 ;; ============================================================
 
 ;; Global Header — 24 bytes
-(define-protocol pcap-global-header
+(struct/wire pcap-global-header
   #:byte-order little
   (magic-number   uint   4)
   (version-major  uint   2)
@@ -23,7 +23,7 @@
   (network        uint   4))
 
 ;; Packet Record Header — 16 bytes
-(define-protocol pcap-record-header
+(struct/wire pcap-record-header
   #:byte-order little
   (ts-sec    uint 4)
   (ts-usec   uint 4)

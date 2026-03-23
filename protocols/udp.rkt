@@ -9,7 +9,7 @@
 ;; All fields big-endian (network byte order).
 ;; ============================================================
 
-(define-protocol udp-header
+(struct/wire udp-header
   #:byte-order big
   (src-port   uint 2)
   (dst-port   uint 2)

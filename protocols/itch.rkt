@@ -10,7 +10,7 @@
 ;; ============================================================
 
 ;; System Event (type "S") — 12 bytes
-(define-protocol itch-system-event
+(struct/wire itch-system-event
   #:byte-order big
   (message-type  alpha  1)
   (stock-locate  uint   2)
@@ -19,7 +19,7 @@
   (event-code    alpha  1))
 
 ;; Add Order — No MPID (type "A") — 36 bytes
-(define-protocol itch-add-order
+(struct/wire itch-add-order
   #:byte-order big
   (message-type  alpha  1)
   (stock-locate  uint   2)
@@ -32,7 +32,7 @@
   (price         uint   4))
 
 ;; Add Order — With MPID (type "F") — 40 bytes
-(define-protocol itch-add-order-mpid
+(struct/wire itch-add-order-mpid
   #:byte-order big
   (message-type  alpha  1)
   (stock-locate  uint   2)
@@ -46,7 +46,7 @@
   (attribution   alpha  4))
 
 ;; Order Executed (type "E") — 31 bytes
-(define-protocol itch-order-executed
+(struct/wire itch-order-executed
   #:byte-order big
   (message-type  alpha  1)
   (stock-locate  uint   2)
@@ -57,7 +57,7 @@
   (match-number  uint   8))
 
 ;; Order Delete (type "D") — 19 bytes
-(define-protocol itch-order-delete
+(struct/wire itch-order-delete
   #:byte-order big
   (message-type  alpha  1)
   (stock-locate  uint   2)
@@ -66,7 +66,7 @@
   (order-ref     uint   8))
 
 ;; Trade — Non-Cross (type "P") — 44 bytes
-(define-protocol itch-trade
+(struct/wire itch-trade
   #:byte-order big
   (message-type  alpha  1)
   (stock-locate  uint   2)

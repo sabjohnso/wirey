@@ -461,6 +461,7 @@
   (let loop ([fs fields] [group '()] [bits 0] [group-order #f])
     (cond
       [(and (pair? fs)
+            (field-desc? (car fs))
             (eq? (field-desc-unit (car fs)) 'bits)
             (or (not group-order)
                 (eq? group-order (effective-order (car fs)))))
@@ -486,7 +487,7 @@
     [(uint)    (decode-uint data offset width order)]
     [(sint)    (decode-sint data offset width order)]
     [(alpha)   (decode-alpha data offset width term)]
-    [(octets)  (decode-octets data offset width)]
+    [(octets)  (if (zero? width) (bytes) (decode-octets data offset width))]
     [(padding) (void)]
     [(float32) (decode-float data offset 4 order)]
     [(float64) (decode-float data offset 8 order)]

@@ -413,6 +413,13 @@
                  #`(make-compute '(* (field-ref ref-name) struct-size)
                      (λ (lk) (* (lk 'ref-name)
                                 (protocol-desc-total-size #,struct-name-stx))))]
+                [((~datum compute) body)
+                 ;; Compute expression for repeat count — wrap with struct size
+                 (define count-compute (width-stx->expr repeat-stx))
+                 #`(make-compute '(* compute-count struct-size)
+                     (λ (lk)
+                       (define count (eval-length-expr #,count-compute lk))
+                       (* count (protocol-desc-total-size #,struct-name-stx))))]
                 [n:nat
                  #`(* n (protocol-desc-total-size #,struct-name-stx))]))
             (define resolved-info
@@ -625,9 +632,23 @@
                            (let ([v (lk '#,fn)])
                              (if (bytes? v) (bytes-length v) 0)))))]
                 [(and (pair? ft) (eq? (car ft) 'repeated-struct))
-                 ;; For repeated structs, width per element × count
-                 ;; Width is the full block — handled by accessor
-                 #'1]
+                 (define marker (list-ref info 11))
+                 (define struct-name (second marker))
+                 (define repeat-stx (third marker))
+                 (define count-compute (width-stx->expr repeat-stx))
+                 ;; Width: for decode, sum actual struct sizes; for encode, use hash bytes
+                 #`(make-compute '(repeated-struct-size)
+                     (λ (lk)
+                       (define data (lk '#:data))
+                       (define off (lk '#:offset))
+                       (define count (eval-length-expr #,count-compute lk))
+                       (if (and data off count (> count 0))
+                           (let loop ([n count] [o off] [total 0])
+                             (if (zero? n) total
+                                 (let ([sz (protocol-desc-total-size-at data o #,struct-name)])
+                                   (loop (sub1 n) (+ o sz) (+ total sz)))))
+                           (let ([v (lk '#,fn)])
+                             (if (bytes? v) (bytes-length v) 0)))))]
                 [else #'1])]
              [else (width-stx->expr fw-stx)]))
          (define effective-bito
@@ -772,6 +793,10 @@
                      #,(syntax-parse repeat-expr
                          [((~datum field-ref) ref-name:id)
                           #`(hash-ref decoded 'ref-name)]
+                         [((~datum compute) body)
+                          (define ce (width-stx->expr repeat-expr))
+                          #`(eval-length-expr #,ce
+                              (λ (name) (hash-ref decoded name #f)))]
                          [n:nat #'n]))
                    ;; Items offset = base + fixed portion size (which excludes variable fields)
                    (define items-offset

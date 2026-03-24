@@ -91,11 +91,28 @@
   #:width  1
   #:type   alpha
   [("S") itch-system-event]
+  [("R") itch-stock-directory]
+  [("H") itch-stock-trading-action]
+  [("Y") itch-reg-sho-restriction]
+  [("L") itch-market-participant-position]
+  [("V") itch-mwcb-decline-level]
+  [("W") itch-mwcb-status]
+  [("K") itch-ipo-quoting-period-update]
+  [("J") itch-luld-auction-collar]
+  [("h") itch-operational-halt]
   [("A") itch-add-order]
   [("F") itch-add-order-mpid]
   [("E") itch-order-executed]
+  [("C") itch-order-executed-price]
+  [("X") itch-order-cancel]
   [("D") itch-order-delete]
-  [("P") itch-trade])
+  [("U") itch-order-replace]
+  [("P") itch-trade]
+  [("Q") itch-cross-trade]
+  [("B") itch-broken-trade]
+  [("I") itch-noii]
+  [("N") itch-retail-price-improvement]
+  [("O") itch-direct-listing])
 
 (describe "ITCH message dispatch"
   (it "dispatches a system event"

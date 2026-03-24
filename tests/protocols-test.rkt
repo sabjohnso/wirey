@@ -9,7 +9,8 @@
          wirey/protocols/ethernet
          wirey/protocols/udp
          wirey/protocols/ipv4
-         wirey/protocols/tcp)
+         wirey/protocols/tcp
+         wirey/protocols/moldudp64)
 
 ;; -- helpers --
 (define (hex->bytes str)
@@ -393,3 +394,127 @@
        (check-equal? s 1)
        (check-equal? a 1)
        (check-equal? dp 49152)])))
+
+;; ===== Complete ITCH 5.0 Message Sizes =====
+
+(describe "ITCH 5.0 message sizes"
+  (it "System Event (S) = 12"
+    (check-equal? (protocol-desc-total-size itch-system-event) 12))
+  (it "Stock Directory (R) = 39"
+    (check-equal? (protocol-desc-total-size itch-stock-directory) 39))
+  (it "Stock Trading Action (H) = 25"
+    (check-equal? (protocol-desc-total-size itch-stock-trading-action) 25))
+  (it "Reg SHO Restriction (Y) = 20"
+    (check-equal? (protocol-desc-total-size itch-reg-sho-restriction) 20))
+  (it "Market Participant Position (L) = 26"
+    (check-equal? (protocol-desc-total-size itch-market-participant-position) 26))
+  (it "MWCB Decline Level (V) = 35"
+    (check-equal? (protocol-desc-total-size itch-mwcb-decline-level) 35))
+  (it "MWCB Status (W) = 12"
+    (check-equal? (protocol-desc-total-size itch-mwcb-status) 12))
+  (it "IPO Quoting Period Update (K) = 28"
+    (check-equal? (protocol-desc-total-size itch-ipo-quoting-period-update) 28))
+  (it "LULD Auction Collar (J) = 35"
+    (check-equal? (protocol-desc-total-size itch-luld-auction-collar) 35))
+  (it "Operational Halt (h) = 21"
+    (check-equal? (protocol-desc-total-size itch-operational-halt) 21))
+  (it "Add Order (A) = 36"
+    (check-equal? (protocol-desc-total-size itch-add-order) 36))
+  (it "Add Order MPID (F) = 40"
+    (check-equal? (protocol-desc-total-size itch-add-order-mpid) 40))
+  (it "Order Executed (E) = 31"
+    (check-equal? (protocol-desc-total-size itch-order-executed) 31))
+  (it "Order Executed Price (C) = 36"
+    (check-equal? (protocol-desc-total-size itch-order-executed-price) 36))
+  (it "Order Cancel (X) = 23"
+    (check-equal? (protocol-desc-total-size itch-order-cancel) 23))
+  (it "Order Delete (D) = 19"
+    (check-equal? (protocol-desc-total-size itch-order-delete) 19))
+  (it "Order Replace (U) = 35"
+    (check-equal? (protocol-desc-total-size itch-order-replace) 35))
+  (it "Trade (P) = 44"
+    (check-equal? (protocol-desc-total-size itch-trade) 44))
+  (it "Cross Trade (Q) = 40"
+    (check-equal? (protocol-desc-total-size itch-cross-trade) 40))
+  (it "Broken Trade (B) = 19"
+    (check-equal? (protocol-desc-total-size itch-broken-trade) 19))
+  (it "NOII (I) = 50"
+    (check-equal? (protocol-desc-total-size itch-noii) 50))
+  (it "Retail Price Improvement (N) = 20"
+    (check-equal? (protocol-desc-total-size itch-retail-price-improvement) 20))
+  (it "Direct Listing (O) = 48"
+    (check-equal? (protocol-desc-total-size itch-direct-listing) 48)))
+
+;; ===== ITCH message round-trips =====
+
+(describe "ITCH stock directory round-trip"
+  (it "encodes and decodes correctly"
+    (define bs (itch-stock-directory-encode
+                #:message-type "R"
+                #:stock-locate 42
+                #:tracking 0
+                #:timestamp #x0000094F7A00
+                #:stock "AAPL"
+                #:market-category "Q"
+                #:financial-status " "
+                #:round-lot-size 100
+                #:round-lots-only "Y"
+                #:issue-classification "A"
+                #:issue-sub-type "NA"
+                #:authenticity "P"
+                #:short-sale-threshold "N"
+                #:ipo-flag " "
+                #:luld-ref-price-tier "1"
+                #:etp-flag "N"
+                #:etp-leverage-factor 0
+                #:inverse-indicator "N"))
+    (define v (itch-stock-directory-decode bs))
+    (check-equal? (itch-stock-directory-stock v) "AAPL")
+    (check-equal? (itch-stock-directory-market-category v) "Q")
+    (check-equal? (itch-stock-directory-round-lot-size v) 100)))
+
+(describe "ITCH order replace round-trip"
+  (it "encodes and decodes correctly"
+    (define bs (itch-order-replace-encode
+                #:message-type "U"
+                #:stock-locate 1
+                #:tracking 0
+                #:timestamp #x0000094F7A00
+                #:original-order-ref 12345
+                #:new-order-ref 67890
+                #:shares 200
+                #:price 1500000))
+    (define v (itch-order-replace-decode bs))
+    (check-equal? (itch-order-replace-original-order-ref v) 12345)
+    (check-equal? (itch-order-replace-new-order-ref v) 67890)
+    (check-equal? (itch-order-replace-shares v) 200)))
+
+;; ===== MoldUDP64 =====
+
+(describe "MoldUDP64 header"
+  (it "has a total size of 20 bytes"
+    (check-equal? (protocol-desc-total-size moldudp64-header) 20))
+
+  (it "round-trips correctly"
+    (define bs (moldudp64-header-encode
+                #:session "SESS000001"
+                #:sequence-number 1000
+                #:message-count 5))
+    (define v (moldudp64-header-decode bs))
+    (check-equal? (moldudp64-header-session v) "SESS000001")
+    (check-equal? (moldudp64-header-sequence-number v) 1000)
+    (check-equal? (moldudp64-header-message-count v) 5)))
+
+(describe "MoldUDP64 message block"
+  (it "encodes length-prefixed message"
+    (define bs (moldudp64-message-block-encode
+                #:message-length 3
+                #:message-data (bytes 1 2 3)))
+    (check-equal? (bytes-length bs) 5)
+    (check-equal? (subbytes bs 0 2) (bytes 0 3)))
+
+  (it "decodes length-prefixed message"
+    (define bs (bytes 0 4 #xDE #xAD #xBE #xEF))
+    (define v (moldudp64-message-block-decode bs))
+    (check-equal? (moldudp64-message-block-message-length v) 4)
+    (check-equal? (moldudp64-message-block-message-data v) (bytes #xDE #xAD #xBE #xEF))))

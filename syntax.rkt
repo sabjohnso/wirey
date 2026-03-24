@@ -180,23 +180,29 @@
           (>= (length (syntax->list w-stx)) 2)
           (eq? (syntax-e (car (syntax->list w-stx))) 'compute))
      (define body (cadr (syntax->list w-stx)))
-     ;; The body is an expression using (field-ref name) forms.
-     ;; We need to build a lambda that takes a lookup function.
-     ;; Replace (field-ref name) with (lk 'name) in the body.
-     (define (transform-compute-body body-stx)
-       (cond
-         [(and (syntax->list body-stx)
-               (= (length (syntax->list body-stx)) 2)
-               (eq? (syntax-e (car (syntax->list body-stx))) 'field-ref))
-          (define ref-name (cadr (syntax->list body-stx)))
-          #`(lk '#,ref-name)]
-         [(syntax->list body-stx)
-          (datum->syntax body-stx
-                         (map transform-compute-body (syntax->list body-stx))
-                         body-stx)]
-         [else body-stx]))
-     (define transformed (transform-compute-body body))
-     #`(make-compute '#,body (λ (lk) #,transformed))]
+     ;; Check if body is already a lambda: (λ (arg) ...)
+     (define body-list (syntax->list body))
+     (if (and body-list
+              (>= (length body-list) 2)
+              (memq (syntax-e (car body-list)) '(λ lambda)))
+         ;; Body is a lambda — use it directly as the compute function
+         #`(make-compute '#,body #,body)
+         ;; Body uses (field-ref name) forms — transform to lambda
+         (let ()
+           (define (transform-compute-body body-stx)
+             (cond
+               [(and (syntax->list body-stx)
+                     (= (length (syntax->list body-stx)) 2)
+                     (eq? (syntax-e (car (syntax->list body-stx))) 'field-ref))
+                (define ref-name (cadr (syntax->list body-stx)))
+                #`(lk '#,ref-name)]
+               [(syntax->list body-stx)
+                (datum->syntax body-stx
+                               (map transform-compute-body (syntax->list body-stx))
+                               body-stx)]
+               [else body-stx]))
+           (define transformed (transform-compute-body body))
+           #`(make-compute '#,body (λ (lk) #,transformed))))]
     [else
      ;; Pass through as a runtime expression (e.g., protocol-desc-total-size call)
      w-stx]))
@@ -457,8 +463,10 @@
 
      ;; Check if a field is a repeated-struct
      (define (field-repeated-struct? info)
-       (define v (and (>= (length info) 12) (list-ref info 11)))
-       (and (pair? v) (eq? (car v) 'repeated-struct)))
+       (define v11 (and (>= (length info) 12) (list-ref info 11)))
+       (define v1 (second info))
+       (or (and (pair? v11) (eq? (car v11) 'repeated-struct))
+           (and (pair? v1) (eq? (car v1) 'repeated-struct))))
 
      ;; Protocols with case blocks or repeated-structs use full-decode accessors
      (define has-case-or-repeated?
@@ -566,6 +574,7 @@
 
      (define (field-padding? info)
        (and (not (case-block-entry? info))
+            (syntax? (second info))
             (eq? (syntax-e (second info)) 'padding)))
 
      ;; Helper: generate a make-field-desc expression from a field-info
@@ -580,7 +589,37 @@
          (define fk (eighth info))
          (define fp (tenth info))
          (define bo-expr (if fb #`'#,fb #`'default-bo))
-         (define width-arg (width-stx->expr fw-stx))
+         ;; Handle embedded/repeated-struct: use octets with placeholder width
+         (define effective-ft
+           (cond
+             [(and (pair? ft) (eq? (car ft) 'embedded)) (datum->syntax #f 'octets)]
+             [(and (pair? ft) (eq? (car ft) 'repeated-struct)) (datum->syntax #f 'octets)]
+             [else ft]))
+         (define width-arg
+           (cond
+             [(not fw-stx)
+              ;; Embedded/repeated struct — compute width at runtime
+              (cond
+                [(and (pair? ft) (eq? (car ft) 'embedded))
+                 (define struct-name (cadr ft))
+                 ;; Width compute that works for both encode (bytes in hash)
+                 ;; and decode (data buffer + offset)
+                 #`(make-compute '(struct-size)
+                     (λ (lk)
+                       (define data (lk '#:data))
+                       (define off (lk '#:offset))
+                       (if (and data off)
+                           ;; Decode path: compute from data buffer
+                           (protocol-desc-total-size-at data off #,struct-name)
+                           ;; Encode path: get from pre-encoded bytes in hash
+                           (let ([v (lk '#,fn)])
+                             (if (bytes? v) (bytes-length v) 0)))))]
+                [(and (pair? ft) (eq? (car ft) 'repeated-struct))
+                 ;; For repeated structs, width per element × count
+                 ;; Width is the full block — handled by accessor
+                 #'1]
+                [else #'1])]
+             [else (width-stx->expr fw-stx)]))
          (define effective-bito
            (or fbi (and (attribute default-bito) #'default-bito)))
          (define kw-args
@@ -589,7 +628,7 @@
                    (if fc (list #'#:compute fc) '())
                    (if fk (list #'#:contract fk) '())
                    (if fp (list #'#:present-when fp) '())))
-         #`(make-field-desc '#,fn '#,ft #,width-arg #,bo-expr #,@kw-args))
+         #`(make-field-desc '#,fn '#,effective-ft #,width-arg #,bo-expr #,@kw-args))
 
      ;; Protocol field list: mix of make-field-desc and make-case-block exprs
      (define fd-exprs
@@ -666,11 +705,18 @@
 
      ;; Helper: is this an embedded struct field?
      (define (field-embedded-struct? info)
-       (define v (list-ref info 11))
-       (and (pair? v) (eq? (car v) 'embedded-struct)))
+       (define v11 (and (>= (length info) 12) (list-ref info 11)))
+       (define v1 (second info))
+       (or (and (pair? v11) (eq? (car v11) 'embedded-struct))
+           (and (pair? v1) (eq? (car v1) 'embedded))))
 
      (define (field-embedded-struct-name info)
-       (cadr (list-ref info 11)))
+       (define v11 (and (>= (length info) 12) (list-ref info 11)))
+       (define v1 (second info))
+       (cond
+         [(and (pair? v11) (eq? (car v11) 'embedded-struct)) (cadr v11)]
+         [(and (pair? v1) (eq? (car v1) 'embedded)) (cadr v1)]
+         [else #f]))
 
      ;; Helper: wrap an accessor body expr with enum lookup if needed
      (define (maybe-wrap-enum info body-expr)

@@ -71,7 +71,17 @@
          (define branch-size
            (if br
                (for/sum ([bf (in-list (case-branch-fields br))])
-                 (field-desc-width bf))
+                 (define raw-w (field-desc-width bf))
+                 (cond
+                   [(exact-positive-integer? raw-w) raw-w]
+                   [(or (compute? raw-w) (field-ref? raw-w))
+                    (eval-length-expr raw-w
+                      (λ (name)
+                        (case name
+                          [(#:data) #f]   ;; no data buffer during size computation
+                          [(#:offset) #f]
+                          [else (hash-ref effective-values name #f)])))]
+                   [else (resolve-width bf effective-values)]))
                0))
          (loop (cdr fields) 0 (+ total flush branch-size))]
         [(and (field-desc-conditional? (car fields))
@@ -109,7 +119,18 @@
                (if (null? bfs)
                    off
                    (let ([bf (car bfs)])
-                     (define w (field-desc-width bf))
+                     (define raw-w (field-desc-width bf))
+                     (define w
+                       (cond
+                         [(exact-positive-integer? raw-w) raw-w]
+                         [(or (compute? raw-w) (field-ref? raw-w))
+                          (eval-length-expr raw-w
+                            (λ (name)
+                              (case name
+                                [(#:data) #f]
+                                [(#:offset) #f]
+                                [else (hash-ref effective-values name #f)])))]
+                         [else (resolve-width bf effective-values)]))
                      (encode-field! buf off bf w (hash-ref effective-values (field-desc-name bf)))
                      (inner-loop (cdr bfs) (+ off w)))))
              byte-off))
@@ -307,10 +328,29 @@
                (if (null? bfs)
                    (values res off)
                    (let* ([bf (car bfs)]
-                          [w (field-desc-width bf)]
-                          [val (decode-field-with-width data off bf w)])
-                     (inner (cdr bfs) (+ off w)
-                            (hash-set res (field-desc-name bf) val)))))
+                          [raw-w (field-desc-width bf)]
+                          ;; Resolve variable-length widths (forgiving lookup for cross-case refs)
+                          ;; Pass #:data and #:offset for struct-size-at computes
+                          [w (cond
+                               [(exact-positive-integer? raw-w) raw-w]
+                               [(field-ref? raw-w)
+                                (eval-length-expr raw-w (λ (name) (hash-ref res name #f)))]
+                               [(compute? raw-w)
+                                (eval-length-expr raw-w
+                                  (λ (name)
+                                    (case name
+                                      [(#:data) data]
+                                      [(#:offset) off]
+                                      [else (hash-ref res name #f)])))]
+                               [else raw-w])]
+                          [val (if (eq? (field-desc-type bf) 'padding)
+                                   (void)
+                                   (decode-field-with-width data off bf w))])
+                     (inner (cdr bfs)
+                            (+ off (if (and (integer? w) (>= w 0)) w 0))
+                            (if (eq? (field-desc-type bf) 'padding)
+                                res
+                                (hash-set res (field-desc-name bf) val))))))
              (values result byte-off)))
        (loop (cdr fields) new-off 0 new-result)]
       ;; Conditional field: check presence predicate
@@ -373,7 +413,11 @@
        (define f (car fields))
        (define w (if (field-desc-variable-length? f)
                      (eval-length-expr (field-desc-width f)
-                                       (λ (name) (hash-ref result name)))
+                                       (λ (name)
+                                         (case name
+                                           [(#:data) data]
+                                           [(#:offset) byte-off]
+                                           [else (hash-ref result name #f)])))
                      (field-desc-width f)))
        (cond
          [(eq? (field-desc-type f) 'padding)

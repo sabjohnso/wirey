@@ -100,6 +100,9 @@
     (cond
       [(null? fields)
        (+ total (quotient bit-acc 8))]
+      ;; Case blocks: skip (variable-size)
+      [(case-block? (car fields))
+       (loop (cdr fields) bit-acc total)]
       [(field-desc-variable-length? (car fields))
        ;; Skip variable-length fields
        (define flush (if (zero? bit-acc) 0 (quotient bit-acc 8)))
@@ -113,7 +116,8 @@
 ;; Does this protocol have any variable-length fields?
 (define (protocol-desc-has-variable-fields? pd)
   (for/or ([f (in-list (protocol-desc-fields pd))])
-    (field-desc-variable-length? f)))
+    (or (case-block? f)
+        (field-desc-variable-length? f))))
 
 ;; Lookup a field by name, or #f if not found
 (define (protocol-desc-field-ref pd name)

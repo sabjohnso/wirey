@@ -1164,3 +1164,223 @@
 *** DONE Step 3: CBOR special values (tags, simple values, floats)
     - Includes indefinite-length encoding with break sentinel
     - Full RFC 8949 Appendix A test vectors
+    - NOTE: Implemented as hand-written codec, not via struct/wire DSL.
+      This was identified as a failure — see v2.0 below.
+
+* The CBOR Problem
+
+  v1.3 implemented CBOR as a hand-written encoder/decoder that uses
+  wirey's codec primitives directly. This proves the primitives are
+  useful building blocks, but it does NOT prove that wirey's DSL can
+  describe self-describing recursive formats.
+
+  The goal was always that wirey should be a complete specification
+  language. If CBOR cannot be expressed through ~struct/wire~, the
+  language is incomplete. The hand-written CBOR module should be
+  replaced by a ~struct/wire~ definition.
+
+** What CBOR needs from ~struct/wire~ that doesn't work today
+
+   Target definition:
+   #+begin_src racket
+   (struct/wire cbor-item
+     #:byte-order big
+     (major-type       uint 3 #:unit bits)
+     (additional-info  uint 5 #:unit bits)
+     (#:case additional-info
+       [((λ (v) (<= v 23)))]
+       [(24) (argument uint 1)]
+       [(25) (argument uint 2)]
+       [(26) (argument uint 4)]
+       [(27) (argument uint 8)])
+     (#:case major-type
+       [(0)] [(1)]
+       [(2) (payload octets (field-ref argument))]
+       [(3) (payload octets (field-ref argument))]
+       [(4) (items cbor-item
+              #:repeat (field-ref argument) #:struct)]
+       [(5) (pairs cbor-item
+              #:repeat (compute (* 2 (field-ref argument)))
+              #:struct)]
+       [(6) (content cbor-item #:struct)]
+       [(7)]))
+   #+end_src
+
+*** Gap 1: Variable-length fields inside ~#:case~ branches
+    Today, ~#:case~ branch fields are parsed as normal field clauses,
+    but the codec path for case-block protocols uses ~decode~ + ~hash-ref~.
+    The low-level ~decode~ handles variable-length fields (it evaluates
+    ~field-ref~ and ~compute~ width expressions). So the codec already
+    supports this — but the ~struct/wire~ macro doesn't pass ~field-ref~
+    width expressions through case branch parsing correctly.
+
+    *Fix*: Ensure ~parse-normal-field~ in case branches produces
+    field-descs with proper ~field-ref~/~compute~ widths, and that
+    the codec's case-block handling evaluates them.
+
+*** Gap 2: ~#:struct~ and ~#:repeat #:struct~ inside ~#:case~ branches
+    Today, ~#:struct~ and ~#:repeat ... #:struct~ are parsed as special
+    field clause patterns at the top level of ~struct/wire~. They are not
+    recognized inside ~#:case~ branch field lists because
+    ~parse-normal-field~ doesn't handle them.
+
+    *Fix*: Extend ~parse-normal-field~ (or the case branch parser)
+    to recognize ~#:struct~ and ~#:repeat ... #:struct~ patterns.
+    The accessor generation for case-block protocols already uses
+    ~decode~ + ~hash-ref~, so the codec needs to handle these field
+    types within case branches.
+
+*** Gap 3: Cross-case field references
+    CBOR has two ~#:case~ blocks in sequence. The second (~#:case major-type~)
+    references ~argument~ which is defined in a branch of the first
+    (~#:case additional-info~). This means:
+
+    - ~argument~ may or may not exist depending on which branch of the
+      first case was active
+    - When ~additional-info <= 23~, there is no ~argument~ field;
+      ~additional-info~ itself IS the argument
+    - The second case's ~(field-ref argument)~ must resolve to either
+      the explicit ~argument~ field or fall back to ~additional-info~
+
+    This is the hardest gap. It requires:
+    a. The codec to evaluate ~field-ref~ against the decoded hash,
+       which includes fields from active case branches
+    b. A way to express "use ~argument~ if present, else ~additional-info~"
+       — this could be a ~compute~ expression:
+       ~(compute (λ (lk) (or (lk 'argument) (lk 'additional-info))))~
+
+*** Gap 4: Recursive ~#:struct~ inside case branches
+    ~(content cbor-item #:struct)~ inside a case branch requires the
+    codec to call ~cbor-item-decode~ recursively. The self-reference
+    works at define time (Racket resolves it lazily in lambda bodies).
+    But the codec's case-block handling would need to recognize
+    embedded/repeated struct fields within branch field-descs and
+    invoke the appropriate decode functions.
+
+    Currently, embedded structs are handled at the ~struct/wire~ macro
+    level by generating custom accessors. For case-block protocols,
+    the accessor uses ~decode~ + ~hash-ref~. So the codec's ~decode~
+    function needs to handle embedded struct decoding within case
+    branches — which it currently doesn't.
+
+*** Gap 5: Indefinite-length encoding
+    CBOR's indefinite-length mode (~additional-info = 31~) uses a
+    break sentinel byte (~0xFF~) to terminate sequences. This is
+    similar to ~#:repeat-until~ but the repeated elements are
+    themselves ~cbor-item~ instances (variable-width, recursive).
+
+    This combines Gap 2 (repeated structs in case branches),
+    Gap 4 (recursive struct references), and ~#:repeat-until~.
+
+* v2.0 — Full-Power Case Branches
+
+** Goal
+   Make ~#:case~ branches support the full feature set of ~struct/wire~
+   fields: variable-length (~field-ref~, ~compute~), embedded structs
+   (~#:struct~), repeated structs (~#:repeat #:struct~), and
+   ~#:repeat-until #:struct~. This enables CBOR to be expressed
+   entirely through the DSL.
+
+** Design Principles
+   - The codec (~decode~/~encode~) is the ground truth. If the codec
+     can handle a feature, ~struct/wire~ should be able to generate it.
+   - Accessors for case-block protocols use ~decode~ + ~hash-ref~.
+     This means all features must work at the codec level within
+     case branches — the macro just needs to generate correct
+     field-descs and case-blocks.
+   - Self-referencing types work through lazy lambda captures.
+     The codec calls decode functions that are defined after the
+     protocol-desc is constructed.
+
+** Implementation Steps [0/8]
+
+*** TODO Step 1: Variable-length fields in case branches
+    - Ensure ~parse-normal-field~ handles ~(field-ref name)~ widths
+      in case branch field lists
+    - Ensure the codec's case-block decode evaluates length expressions
+      against the full decoded hash (including earlier case branch fields)
+    - Test: ~(#:case tag [(1) (data octets (field-ref len))])~ where
+      ~len~ is a field before the case block
+
+*** TODO Step 2: ~field-ref~ across case blocks
+    - When a ~field-ref~ names a field that exists in a case branch,
+      the codec must look it up in the decoded hash (which includes
+      active branch fields)
+    - When the referenced field is absent (inactive branch), the
+      ~field-ref~ should resolve to a default (e.g., the discriminator
+      value itself for CBOR's ~additional-info~/~argument~ pattern)
+    - Introduce ~(field-ref name #:default expr)~ or
+      ~(compute (λ (lk) (or (lk 'argument) (lk 'additional-info))))~
+    - Test: two sequential ~#:case~ blocks, second references first
+
+*** TODO Step 3: Embedded ~#:struct~ in case branches
+    - Extend case branch field parsing to recognize ~(name struct #:struct)~
+    - The codec's case-block decode must call the inner struct's decode
+      function when processing the branch
+    - For the encode direction, accept pre-encoded bytes
+    - Test: ~(#:case tag [(1) (inner some-struct #:struct)])~
+
+*** TODO Step 4: ~#:repeat #:struct~ in case branches
+    - Extend case branch field parsing to recognize
+      ~(name struct #:repeat expr #:struct)~
+    - The codec's case-block decode must call decode-repeated-struct
+    - Test: ~(#:case tag [(4) (items inner #:repeat (field-ref count) #:struct)])~
+
+*** TODO Step 5: Self-referencing ~#:struct~ in case branches
+    - Same as Step 3/4 but the struct references itself
+    - Verify lazy lambda capture works within case-block decode
+    - Test: ~(#:case tag [(6) (content self-type #:struct)])~
+
+*** TODO Step 6: ~#:repeat-until #:struct~ in case branches
+    - For indefinite-length CBOR items
+    - The codec's case-block decode calls decode until break sentinel
+    - Test: ~(#:case tag [(31) (items item #:repeat-until break? #:struct)])~
+
+*** TODO Step 7: CBOR via struct/wire
+    - Rewrite ~protocols/cbor.rkt~ using ~struct/wire~ with
+      full-power case branches
+    - Must pass all existing CBOR tests (RFC 8949 Appendix A vectors)
+    - Remove or deprecate the hand-written CBOR codec
+    - This is the proof that wirey is a complete specification language
+
+*** TODO Step 8: Review and document
+    - Update Scribble docs with CBOR as a worked example
+    - Document the full-power case branch semantics
+    - Update review.org to reflect the completed gap closure
+
+** Acceptance Criteria
+   The following ~struct/wire~ definition must produce a working CBOR
+   codec that passes all RFC 8949 Appendix A test vectors:
+
+   #+begin_src racket
+   (struct/wire cbor-item
+     #:byte-order big
+     (major-type       uint 3 #:unit bits)
+     (additional-info  uint 5 #:unit bits)
+     (#:case additional-info
+       [((λ (v) (<= v 23)))]
+       [(24) (argument uint 1)]
+       [(25) (argument uint 2)]
+       [(26) (argument uint 4)]
+       [(27) (argument uint 8)])
+     (#:case major-type
+       [(0)] [(1)]
+       [(2) (payload octets
+              (compute (λ (lk) (or (lk 'argument) (lk 'additional-info)))))]
+       [(3) (payload octets
+              (compute (λ (lk) (or (lk 'argument) (lk 'additional-info)))))]
+       [(4) (items cbor-item
+              #:repeat (compute (λ (lk) (or (lk 'argument) (lk 'additional-info))))
+              #:struct)]
+       [(5) (pairs cbor-item
+              #:repeat (compute (λ (lk) (* 2 (or (lk 'argument) (lk 'additional-info)))))
+              #:struct)]
+       [(6) (content cbor-item #:struct)]
+       [(7)]))
+   #+end_src
+
+   Note: This definition does not yet handle indefinite-length
+   encoding (~additional-info = 31~), which requires ~#:repeat-until~
+   with struct elements. That is addressed in Step 6 and would add
+   a branch to the ~additional-info~ case and corresponding branches
+   in the ~major-type~ case.

@@ -725,9 +725,9 @@
                 (define info (list-ref all-field-infos i))
                 (define fenum (and (>= (length info) 12) (list-ref info 11)))
                 (cond
-                  ;; Repeated struct: concatenate list of bytes
+                  ;; Repeated struct: concatenate list of bytes (or pass #f for inactive branch)
                   [(and (pair? fenum) (eq? (car fenum) 'repeated-struct))
-                   (list #`'#,fn #`(apply bytes-append #,param))]
+                   (list #`'#,fn #`(if #,param (apply bytes-append #,param) #f))]
                   ;; Enum transform
                   [(and fenum (not (pair? fenum)))
                    (list #`'#,fn #`(wire-enum-ref #,fenum #,param))]

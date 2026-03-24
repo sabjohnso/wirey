@@ -110,6 +110,76 @@
     (check-equal? (cbor-wire-item-additional-info
                    (cbor-wire-item-decode (bytes #xF6))) 22)))
 
+;; ============================================================
+;; Semantic encode tests
+;; ============================================================
+
+(describe "CBOR wire encode: unsigned"
+  (it "0"    (check-equal? (cbor-wire-encode-unsigned 0) (bytes #x00)))
+  (it "1"    (check-equal? (cbor-wire-encode-unsigned 1) (bytes #x01)))
+  (it "23"   (check-equal? (cbor-wire-encode-unsigned 23) (bytes #x17)))
+  (it "24"   (check-equal? (cbor-wire-encode-unsigned 24) (bytes #x18 #x18)))
+  (it "1000" (check-equal? (cbor-wire-encode-unsigned 1000) (bytes #x19 #x03 #xE8)))
+  (it "1000000"
+    (check-equal? (cbor-wire-encode-unsigned 1000000) (hex->bytes "1A 00 0F 42 40"))))
+
+(describe "CBOR wire encode: negative"
+  (it "-1"    (check-equal? (cbor-wire-encode-negative -1) (bytes #x20)))
+  (it "-100"  (check-equal? (cbor-wire-encode-negative -100) (bytes #x38 #x63)))
+  (it "-1000" (check-equal? (cbor-wire-encode-negative -1000) (bytes #x39 #x03 #xE7))))
+
+(describe "CBOR wire encode: text"
+  (it "empty" (check-equal? (cbor-wire-encode-text "") (bytes #x60)))
+  (it "\"a\"" (check-equal? (cbor-wire-encode-text "a") (bytes #x61 #x61)))
+  (it "\"IETF\""
+    (check-equal? (cbor-wire-encode-text "IETF") (bytes #x64 #x49 #x45 #x54 #x46))))
+
+(describe "CBOR wire encode: bytes"
+  (it "empty" (check-equal? (cbor-wire-encode-bytes (bytes)) (bytes #x40)))
+  (it "h'01020304'"
+    (check-equal? (cbor-wire-encode-bytes (bytes 1 2 3 4)) (bytes #x44 1 2 3 4))))
+
+(describe "CBOR wire encode: array"
+  (it "[]"    (check-equal? (cbor-wire-encode-array '()) (bytes #x80)))
+  (it "[1,2,3]"
+    (check-equal? (cbor-wire-encode-array
+                    (list (cbor-wire-encode-unsigned 1)
+                          (cbor-wire-encode-unsigned 2)
+                          (cbor-wire-encode-unsigned 3)))
+                  (bytes #x83 #x01 #x02 #x03))))
+
+(describe "CBOR wire encode: simple"
+  (it "false" (check-equal? (cbor-wire-encode-simple 20) (bytes #xF4)))
+  (it "true"  (check-equal? (cbor-wire-encode-simple 21) (bytes #xF5)))
+  (it "null"  (check-equal? (cbor-wire-encode-simple 22) (bytes #xF6))))
+
+;; ============================================================
+;; Round-trip: CBOR bytes → decode → encode → same bytes
+;; ============================================================
+
+(describe "CBOR wire round-trip (bytes → decode → encode → bytes)"
+  (it "unsigned 0"
+    (define bs (bytes #x00))
+    (check-equal? (cbor-wire-encode-unsigned 0) bs))
+  (it "unsigned 1000"
+    (define bs (bytes #x19 #x03 #xE8))
+    (define v (cbor-wire-item-decode bs))
+    (check-equal? (cbor-wire-encode-unsigned (cbor-argument v)) bs))
+  (it "text \"IETF\""
+    (define bs (bytes #x64 #x49 #x45 #x54 #x46))
+    (define v (cbor-wire-item-decode bs))
+    (check-equal?
+      (cbor-wire-encode-text (bytes->string/utf-8 (cbor-wire-item-payload v))) bs))
+  (it "[1, 2, 3]"
+    (define bs (bytes #x83 #x01 #x02 #x03))
+    (define v (cbor-wire-item-decode bs))
+    (define items (cbor-wire-item-items v))
+    (check-equal?
+      (cbor-wire-encode-array
+        (for/list ([item items])
+          (cbor-wire-encode-unsigned (cbor-argument item))))
+      bs)))
+
 (describe "CBOR wire: complex nested"
   (it "{\"a\": 1, \"b\": [2, 3]}"
     (define v (cbor-wire-item-decode (hex->bytes "A2 61 61 01 61 62 82 02 03")))

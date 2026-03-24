@@ -1,0 +1,291 @@
+#+TITLE: CBOR Encoding Gap Analysis
+#+STARTUP: showall
+
+* Problem Statement
+
+  The ~struct/wire~ definition for CBOR (~cbor-wire-item~) handles
+  decoding correctly — the wire data drives branch selection. But
+  encoding requires hand-written wrapper functions that the DSL
+  should be able to derive from the spec.
+
+  Each wrapper function exists because ~struct/wire~ cannot currently
+  deduce some aspect of encoding from the wire structure definition.
+  This document identifies what's missing in the DSL for each function.
+
+* Function-by-function analysis
+
+** ~argument->ai+ext~ — Discriminator derivation from argument magnitude
+
+   #+begin_src racket
+   (define (argument->ai+ext arg)
+     (cond
+       [(<= arg 23)         (values arg #f)]
+       [(<= arg #xFF)       (values 24 arg)]
+       [(<= arg #xFFFF)     (values 25 arg)]
+       [(<= arg #xFFFFFFFF) (values 26 arg)]
+       [else                (values 27 arg)]))
+   #+end_src
+
+*** What it does
+    Maps an argument value to the ~additional-info~ discriminator and
+    optional ~ext-arg~ field. This is the "shortest encoding" rule:
+    use the smallest wire representation that can hold the value.
+
+*** Why the DSL can't deduce it
+    The ~#:case additional-info~ block defines which branch to take
+    given a discriminator *value*, but not how to *derive* the
+    discriminator value from the data being encoded. The relationship
+    is implicit in the branch structure:
+
+    - Branch for AI ≤ 23: no ext-arg → the argument IS the AI value
+    - Branch for AI = 24: ext-arg is 1 byte → argument fits in uint8
+    - Branch for AI = 25: ext-arg is 2 bytes → argument fits in uint16
+    - etc.
+
+    The DSL spec says "when AI is 24, ext-arg is 1 byte" (decode
+    direction). It does NOT say "when the value fits in 1 byte, use
+    AI=24" (encode direction). This inverse mapping is not expressed
+    anywhere in the ~struct/wire~ definition.
+
+*** What the DSL would need
+    A mechanism to derive discriminator values from content. Something
+    like:
+
+    #+begin_src racket
+    (#:case additional-info
+      #:derive (λ (fields)
+                 (define arg (or (fields 'ext-arg) 0))
+                 (cond [(<= arg 23) arg] [(<= arg #xFF) 24] ...))
+      [((λ (v) (<= v 23)))]
+      [(24) (ext-arg uint 1)]
+      ...)
+    #+end_src
+
+    Or equivalently, each branch could declare its encoding condition:
+
+    #+begin_src racket
+    [(24 #:when (λ (fields) (<= (fields 'ext-arg) #xFF)))
+     (ext-arg uint 1)]
+    #+end_src
+
+** ~encode-head~ — Shared encoding pattern
+
+   #+begin_src racket
+   (define (encode-head major-type argument)
+     (define-values (ai ext) (argument->ai+ext argument))
+     (if ext
+         (cbor-wire-item-encode #:major-type major-type #:additional-info ai #:ext-arg ext)
+         (cbor-wire-item-encode #:major-type major-type #:additional-info ai)))
+   #+end_src
+
+*** Why it exists
+    Encapsulates the conditional keyword argument pattern: when
+    ~ext-arg~ is ~#f~, it must be omitted from the keyword args
+    (since providing ~#:ext-arg #f~ would encode ~#f~ as zero bytes
+    rather than omitting the field entirely).
+
+*** What the DSL would need
+    Passing ~#f~ for a case-branch field should mean "this branch is
+    inactive — omit the field." Currently ~struct/wire~ treats ~#f~
+    as a value to encode. If inactive-branch fields were automatically
+    excluded when their discriminator doesn't select their branch,
+    this function would be unnecessary. The user would just pass all
+    fields and the system would filter based on the active branch.
+
+** ~cbor-wire-encode-unsigned~ — Major type selection
+
+   #+begin_src racket
+   (define (cbor-wire-encode-unsigned n)
+     (encode-head 0 n))
+   #+end_src
+
+*** Why it exists
+    Maps the semantic concept "unsigned integer" to ~major-type = 0~.
+    The user says "encode unsigned 42" and the function knows MT=0.
+
+*** What the DSL would need
+    The relationship between semantic types and major-type values is
+    expressed in the ~#:case major-type~ block:
+    - ~[(0)]~ = unsigned int
+    - ~[(1)]~ = negative int
+    - etc.
+
+    But this is decode-direction only. The DSL doesn't capture that
+    "when the user wants an unsigned integer, set major-type=0."
+    This is a variant of discriminator derivation: derive
+    ~major-type~ from which payload fields the user provides.
+
+    Since the MT=0 branch has no payload fields, the system can't
+    distinguish "unsigned int" from "negative int" by looking at
+    which fields are non-~#f~. Both branches are empty. The
+    distinction is purely semantic — it requires the user to express
+    intent ("I want an unsigned int") which is not part of the wire
+    structure.
+
+    *This is a fundamental limitation*: when multiple branches have
+    the same field structure (or no fields), the encode direction
+    cannot distinguish them without explicit semantic annotation.
+
+** ~cbor-wire-encode-negative~ — Semantic transformation
+
+   #+begin_src racket
+   (define (cbor-wire-encode-negative n)
+     (encode-head 1 (- -1 n)))
+   #+end_src
+
+*** Why it exists
+    CBOR stores negative integers as ~-1 - argument~. The user
+    provides the actual negative integer (e.g., -42) and the function
+    transforms it to the wire representation (argument = 41).
+
+*** What the DSL would need
+    A field-level value transformation for encoding. Something like:
+
+    #+begin_src racket
+    [(1) #:encode-transform (λ (n) (- -1 n))
+         #:decode-transform (λ (arg) (- -1 arg))]
+    #+end_src
+
+    The wire structure specifies the encoding, but not the semantic
+    interpretation. The DSL only describes bytes, not meaning.
+
+** ~cbor-wire-encode-bytes~ and ~cbor-wire-encode-text~ — Length computation
+
+   These functions compute the payload length and derive the
+   argument from it.
+
+*** Why they exist
+    The payload length IS the argument value. The user provides the
+    payload data, and the function computes:
+    1. ~argument = (bytes-length payload)~
+    2. ~(ai, ext-arg) = argument->ai+ext(argument)~
+
+*** What the DSL would need
+    A way to declare that a discriminator's value is derived from
+    another field's content:
+
+    #+begin_src racket
+    (additional-info uint 5 #:unit bits
+      #:derive-from (λ (fields)
+                      (let ([len (bytes-length (or (fields 'payload) (bytes)))])
+                        (cond [(<= len 23) len] [(<= len #xFF) 24] ...))))
+    #+end_src
+
+    This is the combination of two gaps:
+    1. Discriminator derivation (from ~argument->ai+ext~)
+    2. Argument derivation from payload length
+
+** ~cbor-wire-encode-array~ — Count from list length
+
+   Same pattern as bytes/text, but the argument is the count of
+   items rather than the byte length of a payload.
+
+*** What the DSL would need
+    The ~#:repeat~ expression ~(compute (λ (lk) (or ...)))~ defines
+    the decode-direction count. The inverse — "the count IS the
+    repeat value, and the discriminator is derived from it" — is not
+    expressed. A ~#:derive-count~ or similar mechanism would allow
+    the system to infer the argument from the number of items.
+
+** ~cbor-wire-encode-map~ — Count as half the list length
+
+   Maps store ~2 × count~ items (key-value pairs), but the argument
+   is the pair count, not the item count. The function divides by 2.
+
+*** What the DSL would need
+    Same as arrays, but the ~#:repeat~ expression includes a ~* 2~
+    multiplier. The inverse (divide by 2) should be derivable from
+    the forward expression if the DSL could invert simple arithmetic.
+
+** ~cbor-wire-encode-tag~ — Argument is the tag number
+
+   Trivial: the argument IS the tag number. Same pattern as
+   unsigned integers.
+
+** ~cbor-wire-encode-simple~ — Overloaded major type 7
+
+   #+begin_src racket
+   (define (cbor-wire-encode-simple sv)
+     (if (<= sv 23)
+         (cbor-wire-item-encode #:major-type 7 #:additional-info sv)
+         (cbor-wire-item-encode #:major-type 7 #:additional-info 24 #:ext-arg sv)))
+   #+end_src
+
+*** Why it exists
+    Same discriminator derivation as ~argument->ai+ext~, but only
+    for simple values (MT=7). The user provides the simple value and
+    the function determines AI.
+
+** ~cbor-wire-encode-float~ — Type coercion
+
+   #+begin_src racket
+   (define (cbor-wire-encode-float fv)
+     (define float-bytes (real->floating-point-bytes fv 8 #t))
+     (define raw-uint (for/fold ([acc 0]) ([b (in-bytes float-bytes)])
+                        (+ (* acc 256) b)))
+     (cbor-wire-item-encode #:major-type 7 #:additional-info 27 #:ext-arg raw-uint))
+   #+end_src
+
+*** Why it exists
+    Floats share MT=7 with simple values. The ~ext-arg~ field is
+    typed as ~uint~ in the wire structure, but floats need to store
+    IEEE 754 bytes in the same wire position. The function reinterprets
+    float bytes as a uint64.
+
+*** What the DSL would need
+    Per-branch field type overrides. The ~ext-arg~ field is ~uint~ in
+    the AI=24 branch but should be ~float64~ in the AI=27 branch
+    (for double-precision floats). Something like:
+
+    #+begin_src racket
+    (#:case additional-info
+      ...
+      [(27) (ext-arg float64 8)]   ;; when MT=7
+      [(27) (ext-arg uint 8)])     ;; when MT=0-6
+    #+end_src
+
+    But this creates a conflict: AI=27 can mean either uint64 or
+    float64 depending on major-type. This requires *nested* case
+    dispatch: the interpretation of AI=27 depends on both AI and MT
+    simultaneously. The current ~#:case~ system handles sequential
+    (independent) cases, not cross-dependent ones.
+
+* Summary of Missing DSL Features
+
+  | Gap | Wrapper functions affected | Difficulty |
+  |-----+----------------------------+------------|
+  | Discriminator derivation | All | Medium |
+  | Inactive branch field omission | encode-head | Low |
+  | Semantic value transforms | encode-negative, encode-float | Medium |
+  | Count derivation from repeat | encode-array, encode-map | Medium |
+  | Cross-case type overrides | encode-float | Hard |
+  | Identical-structure branch disambiguation | encode-unsigned vs encode-negative | Fundamental |
+
+** Fundamental limitation
+
+   When two case branches have identical field structure (both MT=0
+   and MT=1 have no payload fields), the encode direction cannot
+   determine which branch to use from the provided data alone. The
+   user's intent ("this is an unsigned integer" vs "this is a
+   negative integer") is semantic information not captured by the
+   wire structure.
+
+   This is inherent to self-describing formats: the wire structure
+   carries both data and metadata (type tags). The encode direction
+   requires the user to specify the metadata explicitly or through a
+   semantic API. The DSL describes the wire format; the semantic
+   layer maps application values to wire values.
+
+** What could be automated
+
+   The following could be added to ~struct/wire~ to reduce the
+   wrapper code:
+
+   1. *~#:derive~ on ~#:case~ blocks*: compute discriminator from
+      provided fields
+   2. *Inactive branch omission*: ~#f~ values for branch fields
+      automatically excluded based on discriminator
+   3. *~#:encode-transform~ / ~#:decode-transform~*: per-branch
+      value mappings (like negative integer transformation)
+   4. *Count inference*: derive repeat count from the provided list
+      length, and discriminator from the count

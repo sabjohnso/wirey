@@ -1,0 +1,368 @@
+#+TITLE: wirey Implementation Review
+#+DATE: 2026-03-24
+#+STARTUP: showall
+
+* Summary
+
+  wirey is a Racket-native DSL for binary wire protocol specification.
+  7,172 lines of code across 24 files. 497 tests passing.
+
+  | Category         | Files | Lines |
+  |------------------+-------+-------|
+  | Core modules     |    11 |  2,237 |
+  | Protocol defs    |     9 |   790 |
+  | Tests            |    13 |  3,842 |
+  | Documentation    |     1 |   303 |
+  | Total            |    34 |  7,172 |
+
+* Architecture
+
+** Module Dependency Graph
+
+   #+begin_example
+   main.rkt (re-exports all)
+     ├── field.rkt              (standalone)
+     ├── length-expr.rkt        (standalone)
+     ├── protocol.rkt           → field, length-expr, case-block
+     ├── codec.rkt              → field, protocol, length-expr, case-block
+     ├── syntax.rkt             → field, protocol, codec, length-expr, enum, case-block
+     ├── stack.rkt              → field, protocol, codec
+     ├── dispatch.rkt           → field, codec
+     ├── checksum.rkt           (standalone)
+     ├── enum.rkt               (standalone)
+     └── case-block.rkt         (standalone)
+
+   protocols/*.rkt → syntax.rkt only (via struct/wire)
+   protocols/cbor.rkt → field, codec (direct, not via struct/wire)
+   #+end_example
+
+** Assessment
+   - No circular dependencies
+   - Clean layering: field → protocol → codec → syntax
+   - Standalone modules (checksum, enum, case-block) are properly isolated
+   - Protocol definitions depend only on the macro layer
+   - CBOR is the exception: it uses codec primitives directly because
+     self-describing recursive formats don't fit the struct/wire model
+
+* Bugs
+
+** BUG: ~define-stack~ hardcodes dispatch field name
+   :PROPERTIES:
+   :severity: low
+   :file: [[file:stack.rkt::196][stack.rkt:196]]
+   :END:
+
+   #+begin_src racket
+   #`(make-layer ws #,decode-fn
+                 'dispatch-field #,accessor    ;; ← literal symbol, not variable
+                 #,dispatch-table-expr))
+   #+end_src
+
+   Should be ~'#,dispatch-field~ to splice the actual field name.
+   The ~dispatch-field~ slot in the ~layer~ struct is never read at
+   runtime (dispatch uses the accessor function, not the field name),
+   so this doesn't cause functional failures. It would be incorrect
+   if anyone inspects ~layer-dispatch-field~ for debugging.
+
+** BUG: ~#:terminator~ only works on ~alpha~ fields
+   :PROPERTIES:
+   :severity: low
+   :file: [[file:codec.rkt][codec.rkt]]
+   :END:
+
+   ~encode-alpha!~ and ~decode-alpha~ handle ~#:terminator~, but
+   ~utf8~, ~utf16~, and ~utf32~ encode/decode functions ignore it.
+   The ~field-desc-terminator~ slot is populated but unused for
+   non-alpha string types.
+
+* Code Quality
+
+** Strengths
+
+*** Clean separation of concerns
+    Each module has one reason to change. The data-driven layer
+    (field, protocol, codec) is completely independent of the macro
+    layer (syntax). Protocol definitions are isolated from core logic.
+
+*** Comprehensive input validation
+    ~make-field-desc~ validates all 12 keyword arguments.
+    ~make-protocol-desc~ runs three validation phases:
+    bitfield group alignment, variable-length forward references,
+    and compute expression references.
+
+*** Consistent naming
+    Predicates: ~?~ suffix. Constructors: ~make-~ prefix.
+    Accessors: ~struct-field~ convention. Query functions are
+    descriptive (~protocol-desc-total-size~, ~field-desc-width-in-bits~).
+
+*** No dead code
+    All provides are consumed. No commented-out code. No orphaned
+    helper functions.
+
+*** Zero external dependencies
+    Runtime depends only on ~base~. Build deps are standard
+    (~scribble-lib~, ~racket-doc~, ~rackunit-lib~).
+
+** Weaknesses
+
+*** ~syntax.rkt~ is too large (857 lines)
+    :PROPERTIES:
+    :severity: medium
+    :END:
+
+    The ~struct/wire~ macro handles too many concerns in one file:
+    - Field clause parsing (7 patterns including #:case, #:struct, #:align)
+    - Alignment injection and resolution
+    - Protocol descriptor generation
+    - Three accessor strategies (static, dynamic, case-driven)
+    - Encode keyword generation with optional/default/enum handling
+    - Match expander generation
+
+    *Recommendation*: Extract alignment resolution, accessor generation,
+    and encode formal generation into helper modules or at least
+    clearly delimited ~begin-for-syntax~ sections.
+
+*** ~codec.rkt~ encode/decode are long functions
+    :PROPERTIES:
+    :severity: low
+    :END:
+
+    ~encode~ is ~95 lines with a ~cond~ dispatching on field type,
+    conditional presence, case blocks, bitfield groups, and repeated
+    fields. ~decode~ is similarly long.
+
+    *Recommendation*: Extract per-concern handlers into named functions.
+    The overall structure is sound but readability would improve.
+
+*** No property-based tests
+    :PROPERTIES:
+    :severity: medium
+    :END:
+
+    The project standards call for "Algebra Driven Design & Property
+    Testing" with QCheck. All 497 tests are example-based. Key
+    properties that should be tested:
+    - Round-trip: ~∀ pd vals. decode(encode(vals)) = vals~
+    - Bitfield invariant: MSB and LSB encode/decode are inverses
+    - Size consistency: ~bytes-length(encode(vals)) = total-size(pd, vals)~
+    - Idempotence: ~decode(data) = decode(data)~ (no mutation)
+
+*** No error-path testing for malformed input
+    :PROPERTIES:
+    :severity: medium
+    :END:
+
+    Tests verify correct behavior on well-formed data but do not test:
+    - Truncated packets (offset + width > bytes-length)
+    - Invalid field values (negative uint, oversized bcd)
+    - Corrupted bitfield groups
+    - Malformed CBOR (truncated items, wrong types in indefinite chunks)
+
+    The codec will crash with ~bytes-ref: index is out of range~ on
+    truncated input. This is acceptable if documented, but should be
+    tested and either fail gracefully or documented as requiring
+    well-formed input.
+
+*** CBOR doesn't use ~struct/wire~
+    :PROPERTIES:
+    :severity: informational
+    :END:
+
+    ~protocols/cbor.rkt~ is a hand-written recursive decoder/encoder
+    that uses ~wirey/field~ and ~wirey/codec~ directly. It does not
+    use ~struct/wire~, ~define-dispatch~, or any macro layer.
+
+    This is the right design choice — CBOR's recursive self-describing
+    nature doesn't fit the flat-field model. But it means CBOR is
+    proof that wirey's primitives are useful, not that ~struct/wire~
+    can express everything.
+
+    For wirey to truly claim CBOR expressibility through its DSL,
+    ~struct/wire~ would need recursive case branches — which is a
+    deeper language design problem.
+
+* Module-by-Module Review
+
+** field.rkt — 129 lines
+   :PROPERTIES:
+   :rating: excellent
+   :END:
+
+   Clean, focused, well-validated. The ~field-desc~ struct has grown to
+   12 fields (name, type, width, byte-order, unit, bit-order, compute,
+   contract, present-when, terminator, repeat, repeat-until). This is
+   getting large but each field is justified.
+
+** protocol.rkt — 122 lines
+   :PROPERTIES:
+   :rating: excellent
+   :END:
+
+   Three-phase validation is thorough. Handles both ~field-desc~ and
+   ~case-block~ items in the field list cleanly.
+
+** length-expr.rkt — 44 lines
+   :PROPERTIES:
+   :rating: excellent
+   :END:
+
+   Minimal and focused. ~field-ref~ and ~compute~ are the right
+   abstractions.
+
+** codec.rkt — 622 lines
+   :PROPERTIES:
+   :rating: good
+   :END:
+
+   Handles enormous complexity: bitfields (MSB/LSB), variable-length,
+   conditional presence, case blocks, computed fields, contracts,
+   repeated fields, repeat-until, 12 field types. The code is correct
+   but long. Could benefit from extracting type-specific encode/decode
+   into a registry pattern.
+
+** case-block.rkt — 37 lines
+   :PROPERTIES:
+   :rating: excellent
+   :END:
+
+   Clean data structures. ~case-block-select-branch~ handles both
+   exact values and predicate functions.
+
+** checksum.rkt — 41 lines
+   :PROPERTIES:
+   :rating: excellent
+   :END:
+
+   Correct RFC 1071 implementation. Tested with round-trip verification.
+
+** enum.rkt — 36 lines
+   :PROPERTIES:
+   :rating: excellent
+   :END:
+
+   Clean macro. Bidirectional hash tables. Pass-through for unknown values.
+
+** syntax.rkt — 857 lines
+   :PROPERTIES:
+   :rating: good
+   :END:
+
+   The heart of wirey. Complex but well-structured in phases:
+   1. Parse field clauses (8 patterns)
+   2. Inject alignment padding
+   3. Resolve alignment widths
+   4. Flatten case blocks + collect all field infos
+   5. Generate protocol descriptor expressions
+   6. Generate encode formals (with defaults, enums, optionals)
+   7. Generate accessors (3 strategies)
+   8. Generate match expander
+   9. Emit final ~begin~ form
+
+   The main concern is size. Each new feature (case blocks, repeated
+   structs, embedded structs, enums) added conditionals throughout
+   all phases. This is sustainable for now but would benefit from
+   refactoring before the next major feature.
+
+** stack.rkt — 227 lines
+   :PROPERTIES:
+   :rating: good
+   :END:
+
+   Clean layer/stack abstraction. Dispatch-field bug (see Bugs section)
+   is cosmetic. ~compute-decoded-size~ correctly handles variable-length
+   and bitfield groups.
+
+** dispatch.rkt — 95 lines
+   :PROPERTIES:
+   :rating: excellent
+   :END:
+
+   Simple, focused. O(1) hash lookup.
+
+** main.rkt — 22 lines
+   :PROPERTIES:
+   :rating: good
+   :END:
+
+   Re-exports everything. No dead exports. Could add ~wirey/case-block~
+   to the re-exports for completeness.
+
+* Protocol Definitions
+
+  | Protocol     | File          | Lines | Messages | Completeness |
+  |--------------+---------------+-------+----------+--------------|
+  | Ethernet     | ethernet.rkt  |    17 |        1 | Complete     |
+  | IPv4         | ipv4.rkt      |    27 |        1 | Fixed 20B    |
+  | TCP          | tcp.rkt       |    32 |        1 | Fixed 20B    |
+  | UDP          | udp.rkt       |    17 |        1 | Complete     |
+  | PCAP         | pcap.rkt      |    40 |        3 | Complete     |
+  | ITCH 5.0     | itch.rkt      |   303 |       23 | Complete     |
+  | MoldUDP64    | moldudp64.rkt |    29 |        2 | Complete     |
+  | CBOR         | cbor.rkt      |   300 |      all | RFC 8949     |
+  | Stacks       | stacks.rkt    |    23 |        1 | Eth/IP stack |
+
+  IPv4 and TCP only define the fixed 20-byte portion. Options
+  (variable-length when IHL > 5 or data-offset > 5) are not defined.
+  This is documented in the protocol files.
+
+* Test Suite
+
+  497 tests across 13 files. All passing.
+
+  | File                 | Tests | Coverage area                        |
+  |----------------------+-------+--------------------------------------|
+  | field-test.rkt       |   ~30 | Field validation, all keywords       |
+  | protocol-test.rkt    |   ~20 | Bitfield groups, var-length refs     |
+  | length-expr-test.rkt |   ~16 | field-ref, compute, eval             |
+  | codec-test.rkt       |  ~120 | All types, bitfields, var-len, case  |
+  | checksum-test.rkt    |    ~8 | RFC 1071 round-trip                  |
+  | enum-test.rkt        |   ~10 | Bidirectional mapping                |
+  | case-test.rkt        |   ~18 | Case dispatch, predicates            |
+  | dispatch-test.rkt    |   ~25 | Message dispatch, ITCH routing       |
+  | stack-test.rkt       |   ~40 | Protocol stacks, layered decode      |
+  | syntax-test.rkt      |  ~100 | struct/wire, match, all features     |
+  | protocols-test.rkt   |   ~75 | Real protocols, size verification    |
+  | recursive-test.rkt   |   ~15 | Embedded + self-referencing structs  |
+  | cbor-test.rkt        |  ~120 | RFC 8949 Appendix A vectors          |
+
+** Strengths
+   - Strong round-trip coverage
+   - RFC test vectors for CBOR
+   - Size verification for all 23 ITCH messages
+   - Real protocol examples (Ethernet + IPv4 + TCP/UDP packets)
+
+** Gaps
+   - No property-based tests
+   - No malformed input tests
+   - No performance benchmarks
+   - Limited contract violation testing
+
+* Recommendations
+
+** Priority 1: Fix bugs
+   - [ ] Fix ~'dispatch-field~ literal in ~stack.rkt:196~ → ~'#,dispatch-field~
+   - [ ] Extend ~#:terminator~ support to utf8/utf16/utf32
+
+** Priority 2: Add robustness
+   - [ ] Add property-based round-trip tests using QCheck
+   - [ ] Add malformed input tests (truncated packets)
+   - [ ] Document error behavior (crash vs graceful failure)
+
+** Priority 3: Refactor for maintainability
+   - [ ] Extract alignment logic from ~syntax.rkt~ into helper
+   - [ ] Extract accessor generation strategies into separate functions
+     (partially done with ~make-case-accessor-defs~ etc.)
+   - [ ] Consider type registry pattern for codec encode/decode dispatch
+
+** Priority 4: Documentation
+   - [ ] Update Scribble docs for case blocks, recursive types
+   - [ ] Add performance notes (zero-copy semantics, when it applies)
+   - [ ] Document CBOR as a worked example of using wirey primitives
+   - [ ] Add ~wirey/case-block~ to ~main.rkt~ re-exports
+
+** Priority 5: Future features
+   - [ ] IPv4/TCP options (variable-length header extension)
+   - [ ] SoupBinTCP framing (ITCH alternative transport)
+   - [ ] Extensible type registry (~define-field-type~)
+   - [ ] ~struct/wire~ support for recursive case branches
+     (would allow CBOR to be expressed in the DSL)

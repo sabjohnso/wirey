@@ -448,9 +448,9 @@
     [(float64) (decode-float data offset 8 order)]
     [(bool)    (not (zero? (bytes-ref data offset)))]
     [(bcd)     (decode-bcd data offset width)]
-    [(utf8)    (decode-utf8 data offset width)]
-    [(utf16)   (decode-utf16 data offset width order)]
-    [(utf32)   (decode-utf32 data offset width order)]))
+    [(utf8)    (decode-utf8 data offset width term)]
+    [(utf16)   (decode-utf16 data offset width order term)]
+    [(utf32)   (decode-utf32 data offset width order term)]))
 
 ;; Decode a single field using its own width (byte-unit, fixed-width only)
 (define (decode-field data offset fd)
@@ -526,12 +526,13 @@
   (bytes-copy! buf offset src 0 len))
   ;; remainder is already 0 (null-padded by make-bytes)
 
-(define (decode-utf8 data offset width)
+(define (decode-utf8 data offset width [terminator #f])
   (define raw (subbytes data offset (+ offset width)))
-  ;; Trim trailing null bytes
+  (define term-byte (or terminator 0))
+  ;; Trim trailing terminator/null bytes
   (define trimmed
     (let loop ([end (bytes-length raw)])
-      (if (and (> end 0) (zero? (bytes-ref raw (sub1 end))))
+      (if (and (> end 0) (= (bytes-ref raw (sub1 end)) term-byte))
           (loop (sub1 end))
           (subbytes raw 0 end))))
   (bytes->string/utf-8 trimmed))
@@ -549,8 +550,9 @@
                  (bytes-set! buf (+ off 1) (arithmetic-shift cp -8))))
       (loop (cdr cs) (+ off 2)))))
 
-(define (decode-utf16 data offset width order)
+(define (decode-utf16 data offset width order [terminator #f])
   (define big? (eq? order 'big))
+  (define term-cp (or terminator 0))
   (define chars
     (let loop ([off offset] [acc '()])
       (if (>= (+ off 1) (+ offset width))
@@ -560,8 +562,8 @@
             (define cp (if big?
                            (bitwise-ior (arithmetic-shift hi 8) lo)
                            (bitwise-ior (arithmetic-shift lo 8) hi)))
-            (if (zero? cp)
-                (reverse acc)  ;; null terminator
+            (if (= cp term-cp)
+                (reverse acc)
                 (loop (+ off 2) (cons (integer->char cp) acc)))))))
   (apply string chars))
 
@@ -582,8 +584,9 @@
                  (bytes-set! buf (+ off 3) (arithmetic-shift cp -24))))
       (loop (cdr cs) (+ off 4)))))
 
-(define (decode-utf32 data offset width order)
+(define (decode-utf32 data offset width order [terminator #f])
   (define big? (eq? order 'big))
+  (define term-cp (or terminator 0))
   (define chars
     (let loop ([off offset] [acc '()])
       (if (> (+ off 3) (+ offset width -1))
@@ -597,7 +600,7 @@
                                      (arithmetic-shift (bytes-ref data (+ off 1)) 8)
                                      (arithmetic-shift (bytes-ref data (+ off 2)) 16)
                                      (arithmetic-shift (bytes-ref data (+ off 3)) 24)))])
-            (if (zero? cp)
+            (if (= cp term-cp)
                 (reverse acc)
                 (loop (+ off 4) (cons (integer->char cp) acc)))))))
   (apply string chars))

@@ -601,7 +601,20 @@
   (it "decodes full-width string with no null"
     (define p (make-protocol-desc 'test
                 (list (make-field-desc 'name 'alpha 5 'big #:terminator 0))))
-    (check-equal? (hash-ref (decode p #"hello") 'name) "hello")))
+    (check-equal? (hash-ref (decode p #"hello") 'name) "hello"))
+
+  (it "works with utf8 #:terminator"
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'name 'utf8 8 'big #:terminator 0))))
+    (define bs (bytes-append (string->bytes/utf-8 "hi") (bytes 0 0 0 0 0 0)))
+    (check-equal? (hash-ref (decode p bs) 'name) "hi"))
+
+  (it "works with utf16 #:terminator"
+    (define p (make-protocol-desc 'test
+                (list (make-field-desc 'name 'utf16 8 'big #:terminator 0))))
+    ;; "AB" in UTF-16BE = 00 41 00 42, then null terminated
+    (define bs (bytes #x00 #x41 #x00 #x42 #x00 #x00 #x00 #x00))
+    (check-equal? (hash-ref (decode p bs) 'name) "AB")))
 
 ;; ===== New Field Types =====
 

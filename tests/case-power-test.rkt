@@ -158,6 +158,10 @@
   (it "decodes two levels of recursion"
     ;; tag=1 → child: tag=1 → child: tag=0, value=0x00FF
     (define v (recursive-item-decode (bytes 1  1  0 #x00 #xFF)))
+    (check-equal? (recursive-item-tag v) 1)
     (define child (recursive-item-child v))
+    (check-pred recursive-item? child)
+    (check-equal? (recursive-item-tag child) 1)
     (define grandchild (recursive-item-child child))
+    (check-pred recursive-item? grandchild)
     (check-equal? (recursive-item-value grandchild) #xFF)))

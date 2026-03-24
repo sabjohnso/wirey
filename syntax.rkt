@@ -127,7 +127,17 @@
        (define branch-off
          (if br
              (for/fold ([o off]) ([bf (in-list (case-branch-fields br))])
-               (+ o (field-desc-width bf)))
+               (define raw-w (field-desc-width bf))
+               (define w
+                 (cond
+                   [(exact-positive-integer? raw-w) raw-w]
+                   [else
+                    (define val (hash-ref decoded (field-desc-name bf) #f))
+                    (cond
+                      [(bytes? val) (bytes-length val)]
+                      [(string? val) (string-length val)]
+                      [else 0])]))
+               (+ o w))
              off))
        (loop (cdr fs) branch-off)]
       [(not (field-desc? (car fs))) (loop (cdr fs) off)]

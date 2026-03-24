@@ -13,7 +13,9 @@
          wirey/enum
          wirey/case-block)
 
-(provide struct/wire)
+(provide struct/wire
+         compute-decoded-offset
+         protocol-desc-total-size-at)
 
 ;; ============================================================
 ;; Runtime helpers for variable-length struct/wire instances
@@ -107,6 +109,60 @@
       unsigned))
 
 ;; ============================================================
+;; Runtime helpers for repeated-struct decoding
+;; ============================================================
+
+;; Compute the byte offset after all fixed/decoded fields in a protocol-desc.
+;; Stops before any field that isn't in the decoded hash.
+(define (compute-decoded-offset pd decoded base-offset)
+  (define fields (protocol-desc-fields pd))
+  (let loop ([fs fields] [off base-offset])
+    (cond
+      [(null? fs) off]
+      [(case-block? (car fs))
+       ;; Find the active branch and add its size
+       (define cb (car fs))
+       (define disc-val (hash-ref decoded (case-block-discriminator cb) #f))
+       (define br (and disc-val (case-block-select-branch cb disc-val)))
+       (define branch-off
+         (if br
+             (for/fold ([o off]) ([bf (in-list (case-branch-fields br))])
+               (+ o (field-desc-width bf)))
+             off))
+       (loop (cdr fs) branch-off)]
+      [(not (field-desc? (car fs))) (loop (cdr fs) off)]
+      [(not (hash-has-key? decoded (field-desc-name (car fs)))) off]
+      [(eq? (field-desc-type (car fs)) 'padding)
+       (loop (cdr fs) (+ off (field-desc-width (car fs))))]
+      [(field-desc-conditional? (car fs))
+       (if (hash-ref decoded (field-desc-name (car fs)) #f)
+           (loop (cdr fs) (+ off (field-desc-width (car fs))))
+           (loop (cdr fs) off))]
+      [(eq? (field-desc-unit (car fs)) 'bits)
+       ;; Skip bitfields — they were already counted in the group
+       (define-values (group group-bits remaining)
+         (collect-bitfield-group fs))
+       (loop remaining (+ off (quotient group-bits 8)))]
+      [else
+       (define w (field-desc-width (car fs)))
+       (if (exact-positive-integer? w)
+           (loop (cdr fs) (+ off w))
+           ;; Variable-width: compute from decoded value
+           (let ([val (hash-ref decoded (field-desc-name (car fs)) #f)])
+             (define actual-w
+               (cond
+                 [(bytes? val) (bytes-length val)]
+                 [(string? val) (string-length val)]
+                 [else 0]))
+             (loop (cdr fs) (+ off actual-w))))])))
+
+;; Compute the size of a struct decoded at a given offset.
+;; Uses decode to get the hash, then computes total consumed bytes.
+(define (protocol-desc-total-size-at data offset pd)
+  (define decoded (decode pd data #:offset offset))
+  (- (compute-decoded-offset pd decoded offset) offset))
+
+;; ============================================================
 ;; Match expander helper (compile-time)
 ;; ============================================================
 
@@ -191,10 +247,15 @@
           #:when (eq? (syntax-e #'ftype) 'padding)
           (list #'fname #'ftype #f
                 #f #f #f #f #f (syntax-e #'falign) #f #f #f)]
-         ;; Embedded struct field
+         ;; Embedded struct field (single)
          [(fname:id fstruct:id #:struct)
           (list #'fname (list 'embedded #'fstruct) #f
                 #f #f #f #f #f #f #f #f #f)]
+         ;; Repeated struct field
+         [(fname:id fstruct:id #:repeat frepeat #:struct)
+          (list #'fname (list 'repeated-struct #'fstruct) #f
+                #f #f #f #f #f #f #f #f
+                (list 'repeated-struct #'fstruct #'frepeat))]
          ;; Normal field clause
          [(fname:id ftype:id fwidth
                     (~optional (~seq #:byte-order fbo:id))
@@ -308,15 +369,42 @@
                  (eq? (car (second (car infos))) 'embedded))
             (define info (car infos))
             (define struct-name-stx (cadr (second info)))
-            ;; Create a resolved info: type = octets, width computed at runtime
-            ;; Store the struct name for accessor generation
             (define resolved-info
               (list (first info)
-                    (datum->syntax #f 'octets)   ;; codec type
-                    ;; Width: use (protocol-desc-total-size struct-name) at runtime
+                    (datum->syntax #f 'octets)
                     #`(protocol-desc-total-size #,struct-name-stx)
                     #f #f #f #f #f #f #f #f
                     (list 'embedded-struct struct-name-stx)))
+            (loop (cdr infos) byte-off bit-acc (cons resolved-info acc))]
+           ;; Repeated struct: mark as variable-length octets
+           [(and (pair? (second (car infos)))
+                 (eq? (car (second (car infos))) 'repeated-struct))
+            (define info (car infos))
+            (define marker (list-ref info 11))
+            (define struct-name-stx (second marker))
+            (define repeat-stx (third marker))
+            ;; Store as octets with variable width based on count × struct size
+            ;; For variable-size inner structs, use compute from the actual data
+            ;; For the fd-expr width, use field-ref for the count.
+            ;; The actual bytes-consumed is computed at decode time by the accessor.
+            ;; For encode, we just need the total length of the concatenated bytes.
+            ;; Width for this field: count × inner-struct-size
+            ;; For self-referencing types, the struct-name reference is resolved lazily
+            ;; at runtime (inside the lambda), after the define completes.
+            (define width-expr-stx
+              (syntax-parse repeat-stx
+                [((~datum field-ref) ref-name:id)
+                 #`(make-compute '(* (field-ref ref-name) struct-size)
+                     (λ (lk) (* (lk 'ref-name)
+                                (protocol-desc-total-size #,struct-name-stx))))]
+                [n:nat
+                 #`(* n (protocol-desc-total-size #,struct-name-stx))]))
+            (define resolved-info
+              (list (first info)
+                    (datum->syntax #f 'octets)
+                    width-expr-stx
+                    #f #f #f #f #f #f #f #f
+                    (list 'repeated-struct struct-name-stx repeat-stx)))
             (loop (cdr infos) byte-off bit-acc (cons resolved-info acc))]
            ;; Normal byte field
            [else
@@ -367,9 +455,19 @@
      (define (field-conditional? info)
        (and (>= (length info) 10) (tenth info) #t))
 
-     ;; Case blocks always make the protocol variable-length
-     (define has-variable-fields?
+     ;; Check if a field is a repeated-struct
+     (define (field-repeated-struct? info)
+       (define v (and (>= (length info) 12) (list-ref info 11)))
+       (and (pair? v) (eq? (car v) 'repeated-struct)))
+
+     ;; Protocols with case blocks or repeated-structs use full-decode accessors
+     (define has-case-or-repeated?
        (or (pair? case-block-entries)
+           (ormap field-repeated-struct? all-field-infos)))
+
+     ;; Case blocks and repeated-structs always make the protocol variable-length
+     (define has-variable-fields?
+       (or has-case-or-repeated?
            (ormap (λ (info) (or (variable-width? info) (field-conditional? info)))
                   normal-field-infos)))
 
@@ -556,9 +654,15 @@
                 (define fn (list-ref field-names i))
                 (define info (list-ref all-field-infos i))
                 (define fenum (and (>= (length info) 12) (list-ref info 11)))
-                (if (and fenum (not (pair? fenum)))
-                    (list #`'#,fn #`(wire-enum-ref #,fenum #,param))
-                    (list #`'#,fn param)))))
+                (cond
+                  ;; Repeated struct: concatenate list of bytes
+                  [(and (pair? fenum) (eq? (car fenum) 'repeated-struct))
+                   (list #`'#,fn #`(apply bytes-append #,param))]
+                  ;; Enum transform
+                  [(and fenum (not (pair? fenum)))
+                   (list #`'#,fn #`(wire-enum-ref #,fenum #,param))]
+                  [else
+                   (list #`'#,fn param)]))))
 
      ;; Helper: is this an embedded struct field?
      (define (field-embedded-struct? info)
@@ -590,17 +694,45 @@
      (define (wrap-accessor info body-expr)
        (maybe-wrap-enum info (maybe-wrap-embedded info body-expr)))
 
-     ;; Generate accessor defs for case-block protocols (decode + hash-ref)
+     ;; Generate accessor defs for case-block/repeated-struct protocols
      (define (make-case-accessor-defs)
        (for/list ([aid accessor-ids]
                   [fn field-names]
                   [info all-field-infos]
                   #:unless (field-padding? info))
-         #`(define (#,aid v)
-             (define decoded (decode #,desc-id (#,inst-bytes v)
-                                    #:offset (#,inst-offset v)))
-             (define raw-val (hash-ref decoded '#,fn #f))
-             #,(wrap-accessor info #'raw-val))))
+         (if (field-repeated-struct? info)
+             ;; Repeated struct: custom accessor using decode-repeated-struct
+             ;; The hash-ref approach won't work because the codec can't decode these.
+             ;; Instead, we compute the offset of this field and decode in place.
+             (let* ([marker (list-ref info 11)]
+                    [struct-name (second marker)]
+                    [repeat-expr (third marker)]
+                    [decode-fn (format-id struct-name "~a-decode" struct-name)])
+               #`(define (#,aid v)
+                   ;; Decode the protocol to get the count value and find offset
+                   (define decoded (decode #,desc-id (#,inst-bytes v)
+                                          #:offset (#,inst-offset v)))
+                   (define count
+                     #,(syntax-parse repeat-expr
+                         [((~datum field-ref) ref-name:id)
+                          #`(hash-ref decoded 'ref-name)]
+                         [n:nat #'n]))
+                   ;; Items offset = base + fixed portion size (which excludes variable fields)
+                   (define items-offset
+                     (+ (#,inst-offset v) (protocol-desc-total-size #,desc-id)))
+                   (define-values (items _)
+                     (decode-repeated-struct
+                      (#,inst-bytes v) items-offset count
+                      #,decode-fn
+                      (λ (data offset)
+                        (protocol-desc-total-size-at data offset #,struct-name))))
+                   items))
+             ;; Normal field: decode + hash-ref
+             #`(define (#,aid v)
+                 (define decoded (decode #,desc-id (#,inst-bytes v)
+                                        #:offset (#,inst-offset v)))
+                 (define raw-val (hash-ref decoded '#,fn #f))
+                 #,(wrap-accessor info #'raw-val)))))
 
      ;; Generate accessor defs for dynamic (variable-length, no case blocks)
      (define (make-dynamic-accessor-defs)
@@ -665,7 +797,7 @@
      ;; Select accessor strategy
      (define accessor-defs
        (cond
-         [(pair? case-block-entries) (make-case-accessor-defs)]
+         [has-case-or-repeated? (make-case-accessor-defs)]
          [has-variable-fields? (make-dynamic-accessor-defs)]
          [else (make-static-accessor-defs)]))
 
@@ -680,7 +812,7 @@
 
      #`(begin
          ;; Instance struct
-         #,(if (and has-variable-fields? (not (pair? case-block-entries)))
+         #,(if (and has-variable-fields? (not has-case-or-repeated?))
                #`(struct #,instance-id (bytes offset boundaries))
                #`(struct #,instance-id (bytes offset)))
 
@@ -700,8 +832,8 @@
 
          ;; Decode: bytes [#:offset n] → instance
          #,(cond
-             [(pair? case-block-entries)
-              ;; Case-block protocols: no boundaries needed (accessors use full decode)
+             [has-case-or-repeated?
+              ;; Case-block/repeated-struct protocols: no boundaries needed
               #`(define (#,decode-id data #:offset [offset 0])
                   (#,instance-id data offset))]
              [has-variable-fields?

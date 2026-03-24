@@ -9,6 +9,7 @@
          decode
          decode-field
          decode-bitfield
+         decode-repeated-struct
          resolve-group-bit-order
          collect-bitfield-group)
 
@@ -607,3 +608,15 @@
     (define hi (arithmetic-shift b -4))
     (define lo (bitwise-and b #x0F))
     (+ (* acc 100) (* hi 10) lo)))
+
+;; Decode N instances of a struct, advancing through the buffer.
+;; decode-fn: (bytes #:offset n) → struct-instance
+;; size-fn: (bytes offset) → bytes-consumed
+;; Returns: (values (listof instance) end-offset)
+(define (decode-repeated-struct data offset count decode-fn size-fn)
+  (let loop ([n count] [off offset] [acc '()])
+    (if (zero? n)
+        (values (reverse acc) off)
+        (let ([instance (decode-fn data #:offset off)]
+              [consumed (size-fn data off)])
+          (loop (sub1 n) (+ off consumed) (cons instance acc))))))

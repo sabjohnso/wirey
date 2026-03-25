@@ -200,13 +200,13 @@
 
 ** Phase 3: Encode symmetry
 
-*** TODO Step 8: Inactive branch omission
+*** DONE Step 8: Inactive branch omission
     When encoding a case-block protocol, ~#f~ values for fields in
     inactive branches are automatically excluded. The encoder
     determines the active branch from the discriminator value in the
     hash, and only encodes that branch's fields.
 
-*** TODO Step 9: Value-level encode/decode as first-class
+*** DONE Step 9: Value-level encode/decode as first-class
     The ~#:encode~ and ~#:decode~ options remain as user-provided
     value-mapping functions. The generated ~encode-value~ and
     ~decode-value~ call them.
@@ -218,7 +218,7 @@
 
 ** Phase 4: Verify completeness
 
-*** TODO Step 10: Acceptance tests — all four targets
+*** IN-PROGRESS Step 10: Acceptance tests — all four targets
     The redesign is complete when all four target protocols can be
     expressed cleanly through the DSL:
 

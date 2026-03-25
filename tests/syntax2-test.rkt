@@ -3,8 +3,10 @@
 (require rackunit
          rackunit/spec
          racket/match
+         racket/list
          wirey/syntax2
-         wirey/ir)
+         wirey/ir
+         wirey/ir-codec)
 
 ;; ============================================================
 ;; Basic struct/wire on the new IR
@@ -158,3 +160,72 @@
   (it "overrides defaults"
     (define bs (default-msg-encode #:version 6 #:data #x1234))
     (check-equal? (bytes-ref bs 0) 6)))
+
+;; ============================================================
+;; Phase 3 Step 8: Inactive branch omission
+;; ============================================================
+
+(describe "struct/wire (new IR): inactive branch omission"
+  (it "case branch fields default to #f and are excluded from encoding"
+    ;; Only tag=1 branch fields get encoded
+    (define bs (case-msg-encode #:tag 1 #:val-u8 #xAA))
+    (check-equal? bs (bytes 1 #xAA))
+    ;; val-u16 is #f (default for case branch), not encoded
+    )
+
+  (it "round-trip: decode → encode produces same bytes"
+    (define bs1 (bytes 1 #xAA))
+    (define h (ir-decode case-msg bs1))
+    (define bs2 (ir-encode case-msg h))
+    (check-equal? bs2 bs1))
+
+  (it "round-trip for branch 2"
+    (define bs1 (bytes 2 #xBB #xCC))
+    (define h (ir-decode case-msg bs1))
+    (define bs2 (ir-encode case-msg h))
+    (check-equal? bs2 bs1)))
+
+;; ============================================================
+;; Phase 3 Step 9: Value-level encode/decode
+;; ============================================================
+
+;; A simple tagged format: tag determines interpretation
+(define (tagged-racket->fields v)
+  (cond
+    [(and (integer? v) (>= v 0))
+     (hasheq 'tag 1 'val-u8 v)]
+    [(string? v)
+     (hasheq 'tag 2 'val-u16 (char->integer (string-ref v 0)))]
+    [else (error "cannot encode" v)]))
+
+(define (tagged-fields->racket h)
+  (case (hash-ref h 'tag)
+    [(1) (hash-ref h 'val-u8)]
+    [(2) (string (integer->char (hash-ref h 'val-u16)))]
+    [else #f]))
+
+(struct/wire tagged-value
+  #:byte-order big
+  #:encode tagged-racket->fields
+  #:decode tagged-fields->racket
+  (tag uint 1)
+  (#:case tag
+    [(1) (val-u8  uint 1)]
+    [(2) (val-u16 uint 2)]))
+
+(describe "struct/wire (new IR): value-level encode/decode"
+  (it "encode-value: integer"
+    (check-equal? (tagged-value-encode-value 42) (bytes 1 42)))
+
+  (it "encode-value: string"
+    (check-equal? (tagged-value-encode-value "A") (bytes 2 0 65)))
+
+  (it "decode-value: integer"
+    (check-equal? (tagged-value-decode-value (bytes 1 42)) 42))
+
+  (it "decode-value: string"
+    (check-equal? (tagged-value-decode-value (bytes 2 0 65)) "A"))
+
+  (it "round-trip: Racket value → bytes → Racket value"
+    (check-equal? (tagged-value-decode-value (tagged-value-encode-value 42)) 42)
+    (check-equal? (tagged-value-decode-value (tagged-value-encode-value "A")) "A")))

@@ -163,7 +163,7 @@
 
 ** Phase 2: Rebuild the macro
 
-*** TODO Step 5: Macro produces IR only
+*** DONE Step 5: Macro produces IR only ([[file:syntax2.rkt][syntax2.rkt]])
     The ~struct/wire~ macro's output is:
     1. A protocol-desc (the IR)
     2. A predicate
@@ -178,7 +178,7 @@
     library that operates on the protocol-desc. The macro itself is
     small: it parses syntax and delegates.
 
-*** TODO Step 6: Code generation from IR
+*** DONE Step 6: Code generation from IR
     A library (not a macro) that takes a protocol-desc and generates
     Racket definitions:
     - Encode: walk the element tree, collect field values from the
@@ -190,7 +190,7 @@
 
     This library can be tested independently of the macro.
 
-*** TODO Step 7: Macro field-info uses named representation
+*** DONE Step 7: Macro field-info uses named representation
     The macro's internal field-info is a struct or hash with named
     fields, not a positional list. Adding a new field option is:
     1. Add a slot to the field-info struct

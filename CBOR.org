@@ -259,33 +259,69 @@
   | Semantic value transforms | encode-negative, encode-float | Medium |
   | Count derivation from repeat | encode-array, encode-map | Medium |
   | Cross-case type overrides | encode-float | Hard |
-  | Identical-structure branch disambiguation | encode-unsigned vs encode-negative | Fundamental |
+  | Identical-structure branch disambiguation | encode-unsigned vs encode-negative | Solved by Racket type |
 
-** Fundamental limitation
+** There is no undecidable case
 
-   When two case branches have identical field structure (both MT=0
-   and MT=1 have no payload fields), the encode direction cannot
-   determine which branch to use from the provided data alone. The
-   user's intent ("this is an unsigned integer" vs "this is a
-   negative integer") is semantic information not captured by the
-   wire structure.
+   I previously claimed that MT=0 (unsigned) and MT=1 (negative)
+   are ambiguous because both branches have identical field structure
+   (no payload). This is wrong.
 
-   This is inherent to self-describing formats: the wire structure
-   carries both data and metadata (type tags). The encode direction
-   requires the user to specify the metadata explicitly or through a
-   semantic API. The DSL describes the wire format; the semantic
-   layer maps application values to wire values.
+   The user provides a Racket integer. The sign IS the discriminator:
+   - ~5~ → non-negative → MT=0, argument=5
+   - ~-6~ → negative → MT=1, argument=5 (because -1-5 = -6)
 
-** What could be automated
+   Every Racket value has a unique CBOR encoding:
+   - Non-negative exact integer → MT=0
+   - Negative exact integer → MT=1
+   - Bytes → MT=2
+   - String → MT=3
+   - List → MT=4
+   - Association list / hash → MT=5
+   - Flonum → MT=7 (float)
+   - Boolean / void → MT=7 (simple)
 
-   The following could be added to ~struct/wire~ to reduce the
-   wrapper code:
+   The wire representation is fully determined by the Racket value.
+   There are no decisions that cannot be made.
 
-   1. *~#:derive~ on ~#:case~ blocks*: compute discriminator from
-      provided fields
-   2. *Inactive branch omission*: ~#f~ values for branch fields
-      automatically excluded based on discriminator
-   3. *~#:encode-transform~ / ~#:decode-transform~*: per-branch
-      value mappings (like negative integer transformation)
-   4. *Count inference*: derive repeat count from the provided list
-      length, and discriminator from the count
+** What the DSL needs
+
+   A single mechanism: *~#:encode~ on ~struct/wire~* that maps Racket
+   values to wire field values. This is not per-branch — it is a
+   single function that takes a Racket value and produces the complete
+   set of field values for encoding:
+
+   #+begin_src racket
+   (struct/wire cbor-wire-item
+     #:byte-order big
+     #:encode cbor-racket->fields
+     (major-type       uint 3 #:unit bits)
+     (additional-info  uint 5 #:unit bits)
+     ...)
+   #+end_src
+
+   Where ~cbor-racket->fields~ is:
+
+   #+begin_src racket
+   (define (cbor-racket->fields v)
+     (cond
+       [(and (integer? v) (>= v 0))
+        (define-values (ai ext) (argument->ai+ext v))
+        (hasheq 'major-type 0 'additional-info ai 'ext-arg ext)]
+       [(and (integer? v) (< v 0))
+        (define-values (ai ext) (argument->ai+ext (- -1 v)))
+        (hasheq 'major-type 1 'additional-info ai 'ext-arg ext)]
+       [(bytes? v)
+        (define-values (ai ext) (argument->ai+ext (bytes-length v)))
+        (hasheq 'major-type 2 'additional-info ai 'ext-arg ext 'payload v)]
+       ...))
+   #+end_src
+
+   This is the inverse of decode: decode goes from bytes to Racket
+   values, encode goes from Racket values to bytes. Both directions
+   are deterministic.
+
+   The wrapper functions in ~cbor-wire.rkt~ exist because this
+   ~#:encode~ mechanism does not yet exist. They are not evidence
+   of a fundamental limitation — they are evidence of a missing
+   feature.

@@ -7,7 +7,7 @@
          wirey/protocol
          wirey/codec
          wirey/length-expr
-         wirey/protocols/cbor)
+)
 
 ;; ============================================================
 ;; Property-Based Round-Trip Tests
@@ -206,46 +206,8 @@
       (define bs (encode p (hasheq 'a (random 16) 'b (random 16) 'c (random-uint 2))))
       (check-equal? (bytes-length bs) (protocol-desc-total-size p)))))
 
-;; --- Property: CBOR round-trip ---
-
-(describe "property: CBOR round-trip"
-  (it "unsigned integers"
-    (for ([_ (in-range ITERATIONS)])
-      (define n (random-uint 4))
-      (define v (cbor-unsigned n))
-      (check-equal? (cbor-decode (cbor-encode v)) v)))
-
-  (it "negative integers"
-    (for ([_ (in-range ITERATIONS)])
-      (define n (random-uint 4))
-      (define v (cbor-negative n))
-      (check-equal? (cbor-decode (cbor-encode v)) v)))
-
-  (it "byte strings"
-    (for ([_ (in-range ITERATIONS)])
-      (define len (random 128))
-      (define v (cbor-bytes (random-octets len)))
-      (check-equal? (cbor-decode (cbor-encode v)) v)))
-
-  (it "text strings"
-    (for ([_ (in-range ITERATIONS)])
-      (define v (cbor-text (random-alpha (random 64))))
-      (check-equal? (cbor-decode (cbor-encode v)) v)))
-
-  (it "arrays of unsigned"
-    (for ([_ (in-range 50)])
-      (define items (for/list ([_ (in-range (random 10))])
-                      (cbor-unsigned (random 1000))))
-      (define v (cbor-array items))
-      (check-equal? (cbor-decode (cbor-encode v)) v)))
-
-  (it "maps"
-    (for ([_ (in-range 50)])
-      (define entries (for/list ([i (in-range (random 5))])
-                        (cons (cbor-text (format "key~a" i))
-                              (cbor-unsigned (random 1000)))))
-      (define v (cbor-map entries))
-      (check-equal? (cbor-decode (cbor-encode v)) v))))
+;; CBOR property tests removed — old hand-written CBOR module deleted.
+;; CBOR is now tested through the acceptance tests on the new IR.
 
 ;; --- Property: idempotence ---
 

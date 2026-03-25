@@ -241,7 +241,7 @@
     If the definition requires hand-written Racket code beyond the
     ~#:encode~ / ~#:decode~ value-mapping functions, the DSL has a gap.
 
-*** TODO Step 11: Clean up
+*** DONE Step 11: Clean up
     - Remove the hand-written ~protocols/cbor.rkt~
     - Update Scribble documentation
     - Update review.org and CBOR.org

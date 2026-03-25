@@ -1,21 +1,23 @@
 #+TITLE: CBOR: Gap Analysis and Redesign Plan
 #+STARTUP: showall
 
-* Current State
+* Current State (v2.0)
 
-  CBOR works. 600 tests pass. Both encode and decode function correctly.
-  But the implementation reveals structural problems in wirey that made
-  it far harder than it should have been.
+  CBOR is expressed through the redesigned DSL. The hand-written
+  ~protocols/cbor.rkt~ and ~protocols/cbor-wire.rkt~ have been removed.
+  CBOR now lives in the acceptance test (~tests/acceptance-test.rkt~)
+  as a ~struct/wire~ definition with ~#:encode~ and ~#:decode~
+  value-mapping functions.
 
-  Two CBOR implementations exist:
-  - ~protocols/cbor.rkt~ — hand-written codec (v1.3), works but doesn't
-    use the DSL
-  - ~protocols/cbor-wire.rkt~ — ~struct/wire~ definition (v2.0) with
-    hand-written ~#:encode~ / ~#:decode~ value-mapping functions
+  The ~struct/wire~ definition reads like a specification. The
+  ~#:encode~ / ~#:decode~ functions handle the semantic mapping
+  (Racket value → field hash → bytes and back). The wire structure
+  definition handles the byte-level layout.
 
-  The struct/wire definition proves the DSL can describe CBOR's wire
-  format. The hand-written value functions prove the DSL cannot yet
-  handle the encode direction without help.
+  The redesigned IR (~ir.rkt~), codec (~ir-codec.rkt~), and macro
+  (~syntax2.rkt~) handle CBOR's case dispatch, cross-case variable-
+  length fields, and recursive items cleanly — without the hacks
+  that plagued the v1.x implementation.
 
 * Pain Points from Implementation
 

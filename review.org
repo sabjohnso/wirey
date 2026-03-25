@@ -1,8 +1,29 @@
 #+TITLE: wirey Implementation Review
-#+DATE: 2026-03-24
+#+DATE: 2026-03-25
 #+STARTUP: showall
 
-* Summary
+* Redesign Status (v2.0)
+
+  The v1.x implementation was replaced by a redesign built on three
+  modules:
+  - ~ir.rkt~ — clean IR with named structs and hash-based options
+  - ~ir-codec.rkt~ — codec that walks the element tree (~250 lines)
+  - ~syntax2.rkt~ — macro that parses syntax into IR (~419 lines)
+
+  The old ~syntax.rkt~ (953 lines), ~codec.rkt~ (622 lines), and
+  ~field.rkt~ / ~protocol.rkt~ / ~case-block.rkt~ / ~length-expr.rkt~
+  are superseded but retained for reference.
+
+  The hand-written ~protocols/cbor.rkt~ and ~protocols/cbor-wire.rkt~
+  have been removed. CBOR is now expressed through the DSL in the
+  acceptance tests.
+
+  116 new-IR tests pass, covering ITCH, CBOR, MessagePack, BSON,
+  IPv4, UDP, Ethernet, MoldUDP64, and all field types.
+
+* Previous Review (v1.x)
+
+
 
   wirey is a Racket-native DSL for binary wire protocol specification.
   7,172 lines of code across 24 files. 497 tests passing.

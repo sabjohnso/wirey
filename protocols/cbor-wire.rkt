@@ -9,11 +9,15 @@
 ;; wrapper that reuses this definition.
 ;; ============================================================
 
-(require wirey/syntax
+(require racket/list
+         wirey/syntax
          wirey/protocol
          wirey/codec)
 
 (provide (all-defined-out)
+         cbor-wire-item-encode-value
+         cbor-wire-item-decode-value
+         cbor-wire-item->racket
          cbor-wire-encode-unsigned
          cbor-wire-encode-negative
          cbor-wire-encode-bytes
@@ -27,8 +31,161 @@
 ;; The core CBOR wire structure.
 ;; Each item has an initial byte (major-type + additional-info),
 ;; an optional extended argument, and a type-dependent payload.
+;; Forward declarations for recursive encode/decode
+(define (cbor-racket->fields v)
+  (cond
+    ;; Boolean
+    [(eq? v #t) (hasheq 'major-type 7 'additional-info 21)]
+    [(eq? v #f) (hasheq 'major-type 7 'additional-info 20)]
+    ;; Null
+    [(eq? v 'null) (hasheq 'major-type 7 'additional-info 22)]
+    ;; Non-negative integer
+    [(and (integer? v) (exact? v) (>= v 0))
+     (define-values (ai ext) (argument->ai+ext v))
+     (if ext
+         (hasheq 'major-type 0 'additional-info ai 'ext-arg ext)
+         (hasheq 'major-type 0 'additional-info ai))]
+    ;; Negative integer
+    [(and (integer? v) (exact? v) (< v 0))
+     (define arg (- -1 v))
+     (define-values (ai ext) (argument->ai+ext arg))
+     (if ext
+         (hasheq 'major-type 1 'additional-info ai 'ext-arg ext)
+         (hasheq 'major-type 1 'additional-info ai))]
+    ;; Byte string
+    [(bytes? v)
+     (define-values (ai ext) (argument->ai+ext (bytes-length v)))
+     (if ext
+         (hasheq 'major-type 2 'additional-info ai 'ext-arg ext 'payload v)
+         (hasheq 'major-type 2 'additional-info ai 'payload v))]
+    ;; Text string
+    [(string? v)
+     (define utf8 (string->bytes/utf-8 v))
+     (define-values (ai ext) (argument->ai+ext (bytes-length utf8)))
+     (if ext
+         (hasheq 'major-type 3 'additional-info ai 'ext-arg ext 'payload utf8)
+         (hasheq 'major-type 3 'additional-info ai 'payload utf8))]
+    ;; List → array
+    [(list? v)
+     (define item-bytes (map (λ (item) (cbor-wire-item-encode-value item)) v))
+     (define count (length v))
+     (define-values (ai ext) (argument->ai+ext count))
+     ;; Concatenate for the codec (repeated-struct expects flat bytes)
+     (define items-concat (apply bytes-append item-bytes))
+     (if ext
+         (hasheq 'major-type 4 'additional-info ai 'ext-arg ext 'items items-concat)
+         (hasheq 'major-type 4 'additional-info ai 'items items-concat))]
+    ;; Hash → map
+    [(hash? v)
+     (define entries (hash->list v))
+     (define pair-bytes
+       (for/list ([entry entries])
+         (bytes-append (cbor-wire-item-encode-value (car entry))
+                       (cbor-wire-item-encode-value (cdr entry)))))
+     (define count (length entries))
+     (define-values (ai ext) (argument->ai+ext count))
+     (define pairs-concat (apply bytes-append pair-bytes))
+     (if ext
+         (hasheq 'major-type 5 'additional-info ai 'ext-arg ext 'pairs pairs-concat)
+         (hasheq 'major-type 5 'additional-info ai 'pairs pairs-concat))]
+    ;; Flonum
+    [(flonum? v)
+     (define float-bytes (real->floating-point-bytes v 8 #t))
+     (define raw-uint (for/fold ([acc 0]) ([b (in-bytes float-bytes)])
+                        (+ (* acc 256) b)))
+     (hasheq 'major-type 7 'additional-info 27 'ext-arg raw-uint)]
+    [else (error 'cbor-racket->fields "cannot encode: ~e" v)]))
+
+;; Convert a wire struct instance to a Racket value.
+;; This works on decoded cbor-wire-item instances.
+(define (cbor-wire-item->racket v)
+  (define mt (cbor-wire-item-major-type v))
+  (define ai (cbor-wire-item-additional-info v))
+  (define arg (or (cbor-wire-item-ext-arg v) ai))
+  (case mt
+    [(0) arg]
+    [(1) (- -1 arg)]
+    [(2) (or (cbor-wire-item-payload v) (bytes))]
+    [(3) (bytes->string/utf-8 (or (cbor-wire-item-payload v) (bytes)))]
+    [(4) (define items (or (cbor-wire-item-items v) '()))
+         (for/list ([item items])
+           (cbor-wire-item->racket item))]
+    [(5) (define pairs (or (cbor-wire-item-pairs v) '()))
+         (let loop ([ps pairs] [acc '()])
+           (if (null? ps) (make-immutable-hash (reverse acc))
+               (let ([k (cbor-wire-item->racket (first ps))]
+                     [val (cbor-wire-item->racket (second ps))])
+                 (loop (cddr ps) (cons (cons k val) acc)))))]
+    [(6) (define tagged (cbor-wire-item-tagged v))
+         (if tagged (cbor-wire-item->racket tagged) #f)]
+    [(7) (cond
+           [(= ai 20) #f]
+           [(= ai 21) #t]
+           [(= ai 22) 'null]
+           [(= ai 27)
+            (define raw arg)
+            (define bs (make-bytes 8))
+            (for ([i (in-range 8)])
+              (bytes-set! bs (- 7 i) (bitwise-and (arithmetic-shift raw (* -8 i)) #xFF)))
+            (floating-point-bytes->real bs #t)]
+           [else arg])]))
+
+;; The #:decode function for struct/wire: hash → Racket value
+;; (This is called by cbor-wire-item-decode-value)
+(define (cbor-fields->racket h)
+  (define mt (hash-ref h 'major-type))
+  (define ai (hash-ref h 'additional-info))
+  (define arg (or (hash-ref h 'ext-arg #f) ai))
+  (case mt
+    [(0) arg]
+    [(1) (- -1 arg)]
+    [(2) (hash-ref h 'payload (bytes))]
+    [(3) (bytes->string/utf-8 (hash-ref h 'payload (bytes)))]
+    [(4) ;; Items: raw bytes from codec — decode each item sequentially
+         (define raw (hash-ref h 'items #f))
+         (define count (or (hash-ref h 'ext-arg #f) ai))
+         (if (and raw (bytes? raw) (> count 0))
+             (let loop ([n count] [off 0] [acc '()])
+               (if (zero? n) (reverse acc)
+                   (let ([item (cbor-wire-item-decode raw #:offset off)])
+                     (define sz (protocol-desc-total-size-at raw off cbor-wire-item))
+                     (loop (sub1 n) (+ off sz) (cons (cbor-wire-item->racket item) acc)))))
+             '())]
+    [(5) ;; Pairs: raw bytes — decode sequentially as key,val,key,val,...
+         (define raw (hash-ref h 'pairs #f))
+         (define pair-count (or (hash-ref h 'ext-arg #f) ai))
+         (if (and raw (bytes? raw) (> pair-count 0))
+             (let loop ([n pair-count] [off 0] [acc '()])
+               (if (zero? n) (make-immutable-hash (reverse acc))
+                   (let* ([k (cbor-wire-item-decode raw #:offset off)]
+                          [k-sz (protocol-desc-total-size-at raw off cbor-wire-item)]
+                          [v (cbor-wire-item-decode raw #:offset (+ off k-sz))]
+                          [v-sz (protocol-desc-total-size-at raw (+ off k-sz) cbor-wire-item)])
+                     (loop (sub1 n) (+ off k-sz v-sz)
+                           (cons (cons (cbor-wire-item->racket k)
+                                       (cbor-wire-item->racket v)) acc)))))
+             (make-immutable-hash))]
+    [(6) ;; Tagged: raw bytes — decode the content
+         (define raw (hash-ref h 'tagged #f))
+         (if (and raw (bytes? raw))
+             (cbor-wire-item->racket (cbor-wire-item-decode raw))
+             #f)]
+    [(7) (cond
+           [(= ai 20) #f]
+           [(= ai 21) #t]
+           [(= ai 22) 'null]
+           [(= ai 27)
+            (define raw arg)
+            (define bs (make-bytes 8))
+            (for ([i (in-range 8)])
+              (bytes-set! bs (- 7 i) (bitwise-and (arithmetic-shift raw (* -8 i)) #xFF)))
+            (floating-point-bytes->real bs #t)]
+           [else arg])]))
+
 (struct/wire cbor-wire-item
   #:byte-order big
+  #:encode cbor-racket->fields
+  #:decode cbor-fields->racket
   (major-type       uint 3 #:unit bits)
   (additional-info  uint 5 #:unit bits)
   ;; Extended argument: depends on additional-info

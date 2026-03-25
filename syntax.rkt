@@ -250,6 +250,8 @@
                    #:defaults ([default-bito #f]))
         (~optional (~seq #:alignment default-align:nat)
                    #:defaults ([default-align #f]))
+        (~optional (~seq #:encode encode-fn:expr))
+        (~optional (~seq #:decode decode-fn:expr))
         field-clause ...)
 
      ;; Parse field clauses: 9-element list
@@ -935,4 +937,17 @@
                         (for/list ([entry accessor-table-for-match])
                           (list (car entry) #`#'#,(cdr entry)))))
               pat-stx))
-           (λ (expr-stx) #'#,desc-id)))]))
+           (λ (expr-stx) #'#,desc-id))
+
+         ;; Value-level encode/decode (when #:encode / #:decode provided)
+         #,@(if (attribute encode-fn)
+                (let ([ev-id (format-id #'sname "~a-encode-value" #'sname)])
+                  (list #`(define (#,ev-id v)
+                            (encode #,desc-id (#,(attribute encode-fn) v)))))
+                '())
+         #,@(if (attribute decode-fn)
+                (let ([dv-id (format-id #'sname "~a-decode-value" #'sname)])
+                  (list #`(define (#,dv-id data #:offset [offset 0])
+                            (#,(attribute decode-fn)
+                             (decode #,desc-id data #:offset offset)))))
+                '()))]))

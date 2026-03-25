@@ -180,6 +180,79 @@
           (cbor-wire-encode-unsigned (cbor-argument item))))
       bs)))
 
+;; ============================================================
+;; Value-level encode: Racket value → CBOR bytes
+;; ============================================================
+
+(describe "CBOR wire value-level encode"
+  (it "encodes unsigned integer 0"
+    (check-equal? (cbor-wire-item-encode-value 0) (bytes #x00)))
+  (it "encodes unsigned integer 1"
+    (check-equal? (cbor-wire-item-encode-value 1) (bytes #x01)))
+  (it "encodes unsigned integer 24"
+    (check-equal? (cbor-wire-item-encode-value 24) (bytes #x18 #x18)))
+  (it "encodes unsigned integer 1000"
+    (check-equal? (cbor-wire-item-encode-value 1000) (bytes #x19 #x03 #xE8)))
+  (it "encodes negative integer -1"
+    (check-equal? (cbor-wire-item-encode-value -1) (bytes #x20)))
+  (it "encodes negative integer -100"
+    (check-equal? (cbor-wire-item-encode-value -100) (bytes #x38 #x63)))
+  (it "encodes byte string"
+    (check-equal? (cbor-wire-item-encode-value (bytes 1 2 3 4))
+                  (bytes #x44 1 2 3 4)))
+  (it "encodes text string"
+    (check-equal? (cbor-wire-item-encode-value "IETF")
+                  (bytes #x64 #x49 #x45 #x54 #x46)))
+  (it "encodes empty array"
+    (check-equal? (cbor-wire-item-encode-value '()) (bytes #x80)))
+  (it "encodes array [1, 2, 3]"
+    (check-equal? (cbor-wire-item-encode-value '(1 2 3))
+                  (bytes #x83 #x01 #x02 #x03)))
+  (it "encodes nested array [[1], [2, 3]]"
+    (check-equal? (cbor-wire-item-encode-value '((1) (2 3)))
+                  (hex->bytes "82 81 01 82 02 03")))
+  (it "encodes false"
+    (check-equal? (cbor-wire-item-encode-value #f) (bytes #xF4)))
+  (it "encodes true"
+    (check-equal? (cbor-wire-item-encode-value #t) (bytes #xF5)))
+  (it "encodes null"
+    (check-equal? (cbor-wire-item-encode-value 'null) (bytes #xF6)))
+  (it "encodes float"
+    ;; float64 1.1
+    (check-equal? (cbor-wire-item-encode-value 1.1)
+                  (hex->bytes "FB 3F F1 99 99 99 99 99 9A")))
+  (it "encodes map"
+    (check-equal? (cbor-wire-item-encode-value (hash "a" 1 "b" 2))
+                  ;; Order may vary — just check it decodes correctly
+                  (cbor-wire-item-encode-value
+                    (cbor-wire-item-decode-value
+                      (cbor-wire-item-encode-value (hash "a" 1 "b" 2)))))))
+
+(describe "CBOR wire value-level round-trip"
+  (it "integers"
+    (for ([n (list 0 1 23 24 100 1000 1000000)])
+      (check-equal? (cbor-wire-item-decode-value
+                      (cbor-wire-item-encode-value n)) n))
+    (for ([n (list -1 -10 -100 -1000)])
+      (check-equal? (cbor-wire-item-decode-value
+                      (cbor-wire-item-encode-value n)) n)))
+  (it "strings"
+    (for ([s (list "" "a" "IETF" "hello")])
+      (check-equal? (cbor-wire-item-decode-value
+                      (cbor-wire-item-encode-value s)) s)))
+  (it "byte strings"
+    (for ([bs (list (bytes) (bytes 1 2 3))])
+      (check-equal? (cbor-wire-item-decode-value
+                      (cbor-wire-item-encode-value bs)) bs)))
+  (it "arrays"
+    (for ([v (list '() '(1 2 3) '((1) (2 3)) (list 1 "two" (bytes 3)))])
+      (check-equal? (cbor-wire-item-decode-value
+                      (cbor-wire-item-encode-value v)) v)))
+  (it "booleans and null"
+    (check-equal? (cbor-wire-item-decode-value (cbor-wire-item-encode-value #t)) #t)
+    (check-equal? (cbor-wire-item-decode-value (cbor-wire-item-encode-value #f)) #f)
+    (check-equal? (cbor-wire-item-decode-value (cbor-wire-item-encode-value 'null)) 'null)))
+
 (describe "CBOR wire: complex nested"
   (it "{\"a\": 1, \"b\": [2, 3]}"
     (define v (cbor-wire-item-decode (hex->bytes "A2 61 61 01 61 62 82 02 03")))

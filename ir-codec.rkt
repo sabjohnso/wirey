@@ -57,7 +57,13 @@
       (values (hash-set result name #f) offset)
       ;; Present: decode
       (let ()
-        (define w (resolve-width (wire-field-width elem) result))
+        (define w (resolve-width (wire-field-width elem)
+                    (λ (n)
+                      (case n
+                        [(#:remaining) (- (bytes-length data) offset)]
+                        [(#:data) data]
+                        [(#:offset) offset]
+                        [else (hash-ref result n #f)]))))
         (define raw-val (decode-value type data offset w order))
         (define val (apply-decode-transforms raw-val opts))
         (values (hash-set result name val) (+ offset w)))))

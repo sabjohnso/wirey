@@ -218,7 +218,7 @@
 
 ** Phase 4: Verify completeness
 
-*** IN-PROGRESS Step 10: Acceptance tests — all four targets
+*** DONE Step 10: Acceptance tests — all four targets
     The redesign is complete when all four target protocols can be
     expressed cleanly through the DSL:
 

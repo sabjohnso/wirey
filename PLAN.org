@@ -1,1386 +1,228 @@
 #+TITLE: wirey Plan
 #+STARTUP: showall
 
-* v0.1 — Fixed-Width Wire Structures [COMPLETE]
-
-** Goal
-   Racket-native DSL for binary wire protocol specification.
-   Two layers: data-driven field descriptors + ~struct/wire~ macro surface syntax.
-   Scope: byte-aligned, fixed-width fields with configurable endianness.
-
-** Architecture
-
-*** Layer 1: Data-Driven Protocol Descriptors
-    Core data structures describing binary layouts:
-    - ~field-desc~: name, type, width (bytes), endianness
-    - ~protocol-desc~: name, list of field-desc, total size
-    - Field types: ~'uint~, ~'sint~, ~'alpha~ (fixed-width ASCII), ~'octets~ (raw bytes)
-    - Endianness: ~'big~, ~'little~ (per-field or protocol-wide default)
-
-*** Layer 2: Codec
-    Given a ~protocol-desc~, produce:
-    - ~encode~: hash of name→value → bytes
-    - ~decode~: bytes (+ offset) → hash of name→value
-    - ~decode-field~: bytes + offset + field-desc → single value
-
-*** Layer 3: Macro Surface Syntax (~struct/wire~)
-    #+begin_src racket
-    (struct/wire udp-header
-      #:byte-order big
-      (src-port  uint 2)
-      (dst-port  uint 2)
-      (length    uint 2)
-      (checksum  uint 2))
-    #+end_src
-    Generates:
-    - ~udp-header~ — protocol-desc value + match expander
-    - ~udp-header?~ — predicate
-    - ~udp-header-encode~ — keyword args → bytes
-    - ~udp-header-decode~ — bytes → zero-copy struct instance
-    - ~udp-header-src-port~, etc. — lazy field accessors
-    - Match patterns: ~(udp-header #:dst-port dp)~
-
-** Modules
-
-   | File                              | Purpose                              |
-   |-----------------------------------+--------------------------------------|
-   | ~wirey/field.rkt~                 | field-desc struct, type predicates   |
-   | ~wirey/protocol.rkt~              | protocol-desc struct, validation     |
-   | ~wirey/codec.rkt~                 | Generic encode/decode/decode-field   |
-   | ~wirey/syntax.rkt~                | struct/wire macro                    |
-   | ~wirey/main.rkt~                  | Re-exports public API                |
-   | ~wirey/protocols/itch.rkt~        | ITCH 5.0 message definitions         |
-   | ~wirey/protocols/pcap.rkt~        | PCAP global + record headers         |
-   | ~wirey/protocols/ethernet.rkt~    | Ethernet frame header                |
-   | ~wirey/protocols/udp.rkt~         | UDP header                           |
-
-** Implementation Steps [7/7]
-
-*** DONE Step 1: Field descriptors
-*** DONE Step 2: Protocol descriptors
-*** DONE Step 3: Codec — encoding
-*** DONE Step 4: Codec — decoding
-*** DONE Step 5: struct/wire macro (keyword encode, zero-copy decode, match)
-*** DONE Step 6: Protocol definitions (ITCH, PCAP, Ethernet, UDP)
-*** DONE Step 7: Package integration + Scribble docs
-
-* v0.2 — Bitfields
-
-** Goal
-   Support sub-byte fields so we can describe IPv4 and TCP headers,
-   where fields like ~version~ (4 bits), ~ihl~ (4 bits), ~flags~ (3 bits),
-   and ~fragment-offset~ (13 bits) don't fall on byte boundaries.
-
-** Design
-
-*** New field width unit
-    Bitfields need widths in bits rather than bytes. Introduce a
-    ~#:unit~ option (defaulting to ~bytes~ for backward compatibility):
-    #+begin_src racket
-    (struct/wire ipv4-header
-      #:byte-order big
-      (version          uint 4 #:unit bits)
-      (ihl              uint 4 #:unit bits)
-      (dscp             uint 6 #:unit bits)
-      (ecn              uint 2 #:unit bits)
-      (total-length     uint 2)
-      (identification   uint 2)
-      (flags            uint 3 #:unit bits)
-      (fragment-offset  uint 13 #:unit bits)
-      (ttl              uint 1)
-      (protocol         uint 1)
-      (header-checksum  uint 2)
-      (src-ip           uint 4)
-      (dst-ip           uint 4))
-    #+end_src
-
-*** Bit-level codec
-    - Bitfields are packed MSB-first within their containing byte(s),
-      matching network byte order convention (the way IPv4/TCP define them).
-    - A bitfield group is a contiguous run of bit-width fields. The group
-      must sum to a whole number of bytes (enforced at definition time).
-    - Encoding: accumulate bits into a buffer, flush to bytes at group boundary.
-    - Decoding: read the byte span, extract bits via shift and mask.
-
-*** Validation
-    - Bitfield groups must sum to 8·N bits (no partial bytes).
-    - Mixing byte-width and bit-width fields within the same byte is an error
-      (bitfields must be grouped together to form complete bytes).
-    - A bitfield's value must fit within its bit width.
-
-*** Impact on existing code
-    - ~field-desc~ gains an optional unit (~'bytes~ or ~'bits~), defaulting to ~'bytes~.
-    - ~protocol-desc-total-size~ must account for bitfield groups.
-    - ~encode~/~decode~/~decode-field~ extended with bit-level read/write.
-    - All existing byte-aligned code continues to work unchanged.
-
-** Target protocols
-   - IPv4 header (20 bytes fixed, bitfields in bytes 0-1 and 6-7)
-   - TCP header (20 bytes fixed, bitfields in bytes 12-13)
-
-** Implementation Steps [5/5]
-
-*** DONE Step 1: Extend ~field-desc~ with ~#:unit~ (~'bytes~ | ~'bits~)
-    - Add unit field to ~field-desc~ struct (default ~'bytes~)
-    - Backward compatible: existing code unaffected
-    - Tests: construction with unit, validation
-
-*** DONE Step 2: Bitfield group validation
-    - Detect contiguous bitfield runs in a protocol-desc
-    - Validate each group sums to a whole byte count
-    - Reject mixed byte/bit fields within a byte boundary
-    - Tests: valid groups pass, invalid groups raise errors
-
-*** DONE Step 3: Bit-level encoding
-    - Encode bitfield groups: accumulate bits, flush to bytes
-    - Byte-aligned fields encode as before
-    - Tests: encode IPv4 version/ihl nibbles, flags/fragment-offset
-
-*** DONE Step 4: Bit-level decoding
-    - Decode bitfield groups: read byte span, extract via shift/mask
-    - ~decode-bitfield~ for accessors in struct/wire
-    - Tests: decode known IPv4/TCP byte sequences
-    - Round-trip tests for bitfield values
-
-*** DONE Step 5: IPv4 and TCP wire struct definitions
-    - ~protocols/ipv4.rkt~ — IPv4 header (fixed 20-byte portion)
-    - ~protocols/tcp.rkt~ — TCP header (fixed 20-byte portion)
-    - Tests: encode/decode known packets, match patterns
-    - Update Scribble docs
-
-* v0.3 — Variable-Length Fields and Dependent Lengths
-
-** Goal
-   Support fields whose length is determined by the value of another field,
-   enabling protocols with variable-length regions (IPv4/TCP options,
-   PCAP packet data, TLV structures).
-
-** Design
-
-*** Dependent length expressions
-    A field's width can reference another field's decoded value:
-    #+begin_src racket
-    (struct/wire pcap-packet
-      #:byte-order little
-      (ts-sec    uint 4)
-      (ts-usec   uint 4)
-      (incl-len  uint 4)
-      (orig-len  uint 4)
-      (data      octets (field-ref incl-len)))
-    #+end_src
-
-    ~(field-ref incl-len)~ means "the width of ~data~ is the decoded value
-    of the ~incl-len~ field." The referenced field must appear before the
-    dependent field.
-
-*** Computed width expressions
-    For IPv4 options, the length is derived from a field value:
-    #+begin_src racket
-    (struct/wire ipv4-header-full
-      #:byte-order big
-      (version     uint 4 #:unit bits)
-      (ihl         uint 4 #:unit bits)
-      ...
-      (dst-ip      uint 4)
-      (options     octets (compute (* (- (field-ref ihl) 5) 4))))
-    #+end_src
-
-    ~(compute expr)~ allows arithmetic on field references.
-
-*** Impact on total-size
-    - ~protocol-desc-total-size~ returns the fixed portion only when
-      variable-length fields are present.
-    - Add ~protocol-desc-fixed-size~ for the guaranteed minimum.
-    - Actual message size is known only after decoding the length fields.
-
-*** Encoding changes
-    - Variable-length fields require the encoder to know the actual data length.
-    - The encoder validates consistency: if ~incl-len~ is 64, ~data~ must be
-      64 bytes. Raise an error on mismatch.
-
-*** Decoding changes
-    - Decode fields sequentially. When a variable-length field is reached,
-      evaluate its length expression using already-decoded field values.
-    - The zero-copy decode instance stores the computed field boundaries.
-
-** Target protocols
-   - PCAP packet (header + variable-length captured data)
-   - IPv4 with options
-   - TCP with options
-
-** Implementation Steps [5/5]
-
-*** DONE Step 1: Length expression AST (~wirey/length-expr.rkt~)
-    - ~field-ref~ and ~compute~ structs as length expression types
-    - ~eval-length-expr~ evaluates against a field lookup function
-    - Backward compatible: integer widths still work
-
-*** DONE Step 2: Validation of dependent fields
-    - ~field-desc~ accepts field-ref/compute as width
-    - protocol-desc validates referenced fields exist and appear earlier
-    - Tests: valid references pass, forward/missing references error
-
-*** DONE Step 3: Variable-length encoding
-    - Codec resolves width via eval-length-expr against values hash
-    - Validates data length consistency
-    - Tests: encode framed messages, compute expressions
-
-*** DONE Step 4: Variable-length decoding
-    - Sequential decode with length expression evaluation
-    - struct/wire stores precomputed boundaries for variable-length protocols
-    - Dynamic accessors look up boundaries at runtime
-    - Round-trip tests pass
-
-*** DONE Step 5: Protocol definitions
-    - ~pcap-packet~ with ~(field-ref incl-len)~ for variable-length data
-    - ~struct/wire~ recognizes ~(field-ref name)~ and ~(compute expr)~ syntax
-    - Scribble docs deferred to batch update
-
-* v0.4 — Protocol Composition
-
-** Goal
-   Compose wire structures into layered protocol stacks, so a single
-   decode call can peel through Ethernet → IPv4 → TCP and provide
-   access to each layer's fields.
-
-** Design
-
-*** Layer stacking
-    Define a protocol stack as a sequence of wire structures where
-    each layer's payload contains the next:
-    #+begin_src racket
-    (define-stack tcp/ip-stack
-      ethernet-header
-      #:dispatch ethertype
-      [(#x0800)
-       ipv4-header
-       #:dispatch protocol
-       [(6)  tcp-header]
-       [(17) udp-header]])
-    #+end_src
-
-*** Dispatch on field values
-    Each layer boundary includes a dispatch expression that examines
-    a field from the current layer to determine which wire struct
-    to decode next. This is essentially pattern matching on the wire.
-
-*** Decoded stack value
-    The result of decoding a stack is a nested structure where each
-    layer is accessible:
-    #+begin_src racket
-    (define pkt (tcp/ip-stack-decode raw-bytes))
-    (ethernet-header-ethertype (stack-layer pkt 'ethernet-header))
-    (ipv4-header-src-ip (stack-layer pkt 'ipv4-header))
-    (tcp-header-dst-port (stack-layer pkt 'tcp-header))
-    #+end_src
-
-*** Match on stacks
-    Extend match patterns to work across layers:
-    #+begin_src racket
-    (match (tcp/ip-stack-decode raw-bytes)
-      [(tcp/ip-stack
-        (ethernet-header #:ethertype #x0800)
-        (ipv4-header #:src-ip src)
-        (tcp-header #:dst-port 80))
-       (printf "HTTP from ~a\n" src)])
-    #+end_src
-
-*** Offset threading
-    Each layer computes its payload offset from its own header size.
-    The next layer's decode begins at that offset. Variable-length
-    headers (IPv4 with IHL, TCP with data-offset) use the header
-    length field to compute the payload start.
-
-** Target protocols
-   - Ethernet → IPv4 → TCP stack
-   - Ethernet → IPv4 → UDP stack
-   - PCAP file → packet → Ethernet → ... (full pcap parsing)
-
-** Implementation Steps [5/5]
-
-*** DONE Step 1: Stack descriptor data structure (~wirey/stack.rkt~)
-    - ~layer~ struct: protocol-desc, decode-fn, dispatch-field, dispatch-accessor, dispatch-table
-    - ~stack-desc~ struct: name, list of layers (root + named)
-    - ~make-layer~ / ~make-layer/named~ constructors
-
-*** DONE Step 2: Stack decoding
-    - Sequential layer decoding with offset threading
-    - Dispatch table lookup via accessor → layer name → next layer
-    - ~stack-value~ holds decoded layer instances
-    - ~stack-ref~ finds a layer by predicate
-
-*** DONE Step 3: ~define-stack~ macro
-    - Nested tree syntax with ~#:dispatch~ and value branches
-    - Generates stack-desc + ~name-decode~ function
-    - Auto-generates unique layer names from wire struct names
-
-*** DONE Step 4: Stack match patterns
-    - Wire struct match expanders compose naturally with ~stack-ref~
-    - ~(match (stack-ref result pred?) [(wire-struct ...) ...])~
-    - No dedicated stack match expander needed — composition suffices
-
-*** DONE Step 5: Protocol stack definitions
-    - ~protocols/stacks.rkt~ with ~ethernet/ip-stack~ (Ethernet → IPv4 → TCP/UDP)
-    - ~main.rkt~ re-exports ~wirey/stack~ and ~wirey/length-expr~
-    - Tests decode real multi-layer Ethernet/IPv4/TCP and UDP packets
-
-* v0.5 — Computed Fields
-
-** Goal
-   Support fields whose values are computed from other fields rather than
-   provided directly. Primary use case: checksums (IPv4 header checksum,
-   TCP/UDP checksum with pseudo-header).
-
-** Design
-
-*** Computed field declaration
-    #+begin_src racket
-    (struct/wire ipv4-header
-      #:byte-order big
-      ...
-      (header-checksum  uint 2 #:compute ipv4-checksum)
-      ...)
-    #+end_src
-
-    ~#:compute~ names a function that receives the partially-encoded
-    bytes and returns the field's value. The function signature:
-    #+begin_src racket
-    ;; ipv4-checksum : bytes -> exact-nonneg-integer?
-    ;; Receives the fully-encoded header with the checksum field zeroed.
-    ;; Returns the one's complement checksum.
-    #+end_src
-
-*** Encoding with computed fields
-    Two-pass encoding:
-    1. Encode all fields, using zero for computed fields.
-    2. For each computed field, call its function with the buffer,
-       then write the result into the appropriate offset.
-
-*** Decoding with computed fields
-    Computed fields decode normally (they're just uint/sint on the wire).
-    Optionally, a ~#:validate~ flag can verify the checksum on decode
-    and raise an error or warning on mismatch.
-
-*** Checksum library
-    Provide common checksum implementations:
-    - ~ipv4-header-checksum~: one's complement sum of 16-bit words
-    - ~internet-checksum~: generalized for TCP/UDP pseudo-header
-
-** Target protocols
-   - IPv4 header checksum
-   - UDP checksum (with pseudo-header, optional in IPv4)
-   - TCP checksum (with pseudo-header)
-
-** Implementation Steps [4/4]
-
-*** DONE Step 1: ~#:compute~ in field-desc and struct/wire
-    - field-desc gains optional compute function (~field-desc-compute~, ~field-desc-computed?~)
-    - struct/wire parses ~#:compute fn~ in field specs
-    - Computed fields omitted from encode keyword args
-
-*** DONE Step 2: Two-pass encoding
-    - First pass: encode with zero for computed fields
-    - Second pass: call compute functions with buffer, write results
-    - Tests: simple checksum computation, value verification
-
-*** DONE Step 3: Checksum library (~wirey/checksum.rkt~)
-    - ~internet-checksum~: RFC 1071 one's complement of 16-bit words
-    - ~ipv4-header-checksum~: delegates to internet-checksum
-    - Tests: verification property (include checksum → result is 0)
-
-*** DONE Step 4: struct/wire integration
-    - ~#:compute~ parsed in field clauses, generates ~#:compute fn~ in field-desc
-    - Computed fields excluded from encode keyword formals
-    - Decode/match/accessors work normally for computed fields
-    - 205 tests passing
-
-* v0.6 — Message Dispatch
-
-** Goal
-   Route incoming bytes to the correct wire struct based on a
-   discriminator field. Primary use case: ITCH 5.0 message type
-   byte determines which of ~20 message formats to decode.
-
-** Design
-
-*** Dispatch declaration
-    #+begin_src racket
-    (define-dispatch itch-message
-      #:on message-type
-      #:offset 0
-      #:width 1
-      #:type alpha
-      [("S") itch-system-event]
-      [("A") itch-add-order]
-      [("F") itch-add-order-mpid]
-      [("E") itch-order-executed]
-      [("D") itch-order-delete]
-      [("P") itch-trade])
-    #+end_src
-
-*** Dispatch decoding
-    #+begin_src racket
-    (define msg (itch-message-decode raw-bytes))
-    ;; msg is one of the wire struct types
-    (cond
-      [(itch-system-event? msg) ...]
-      [(itch-add-order? msg) ...]
-      ...)
-    #+end_src
-
-*** Integration with match
-    #+begin_src racket
-    (match (itch-message-decode raw-bytes)
-      [(itch-add-order #:stock sym #:price p #:shares s)
-       (printf "Order: ~a ~a @ ~a\n" sym s p)]
-      [(itch-trade #:stock sym #:price p)
-       (printf "Trade: ~a @ ~a\n" sym p)])
-    #+end_src
-
-    This works naturally because each wire struct already has its
-    own match expander — dispatch just selects which one applies.
-
-*** Performance
-    The discriminator is read once (a single byte for ITCH), then
-    an O(1) lookup (hash table) selects the wire struct. The selected
-    struct's decode is zero-copy as before.
-
-** Target protocols
-   - ITCH 5.0 full message dispatch (all ~20 message types)
-   - Ethernet ethertype dispatch (IPv4, IPv6, ARP)
-   - IPv4 protocol dispatch (TCP, UDP, ICMP)
-
-** Implementation Steps [4/4]
-
-*** DONE Step 1: Dispatch descriptor (~wirey/dispatch.rkt~)
-    - ~dispatch-desc~ struct: discriminator offset/width/type + hash table
-    - ~make-dispatch-desc~ with #:offset, #:width, #:type, #:byte-order
-    - Entries map discriminator values to (protocol-desc, decode-fn, pred-fn)
-
-*** DONE Step 2: Dispatch decoding
-    - Read discriminator field from bytes at specified offset/width
-    - O(1) hash lookup to select wire struct
-    - Decode full message with selected wire struct's decode function
-    - Returns #f for unknown discriminator values
-
-*** DONE Step 3: ~define-dispatch~ macro
-    - Surface syntax: ~[(value) wire-struct] ...~
-    - Auto-derives ~-decode~ and ~-?~ identifiers from wire struct name
-    - Generates dispatch-desc + ~name-decode~ function
-
-*** DONE Step 4: ITCH message dispatch + integration
-    - ~itch-message~ dispatch over all 6 ITCH message types
-    - Works naturally with match: each wire struct has its own expander
-    - ~main.rkt~ re-exports ~wirey/dispatch~ and ~wirey/checksum~
-    - 216 tests passing
-
-* v0.7 — Contracts on Field Values
-
-** Goal
-   Attach contracts to wire struct fields for runtime validation
-   of encoded values and optionally decoded values.
-
-** Design
-
-*** Contract declaration
-    #+begin_src racket
-    (struct/wire udp-header
-      #:byte-order big
-      (src-port   uint 2 #:contract (integer-in 0 65535))
-      (dst-port   uint 2 #:contract (integer-in 0 65535))
-      (length     uint 2 #:contract (>=/c 8))
-      (checksum   uint 2))
-    #+end_src
-
-*** Encoding contracts
-    Contracts are checked when encoding. If a value violates its
-    contract, a clear error is raised naming the field and the
-    constraint.
-
-*** Decoding contracts
-    Optional: ~#:validate-on-decode~ flag. Useful for detecting
-    malformed packets. Off by default (wire data may legitimately
-    violate "should" constraints).
-
-*** Interaction with computed fields
-    Computed fields can have contracts too — the contract is checked
-    after computation.
-
-** Implementation Steps [3/3]
-
-*** DONE Step 1: ~#:contract~ in field-desc and struct/wire
-    - field-desc gains optional contract predicate (~field-desc-contract~, ~field-desc-has-contract?~)
-    - struct/wire parses ~#:contract expr~ in field specs
-    - Generates ~#:contract fn~ in make-field-desc calls
-
-*** DONE Step 2: Encode-time validation
-    - Contracts checked before encoding (after computed field placeholder)
-    - Computed fields skip contract check at encode time
-    - Clear error messages include field name and rejected value
-    - Tests: valid/invalid values, field name in error, computed field skip
-
-*** DONE Step 3: struct/wire integration
-    - Encode keyword args trigger contract validation automatically
-    - Decode works normally (contracts are encode-time only)
-    - 227 tests passing
-
-* ACN Completeness Roadmap
-
-  wirey aims to be a complete specification language for binary wire
-  protocols, matching the capabilities of ACN (ASN.1 Control Notation)
-  in Racket-native form. The following versions close the remaining
-  gaps between wirey and what ACN can express.
-
-* v0.8 — Bit Ordering
-
-** Goal
-   Support both MSB-first and LSB-first bit packing, with a four-level
-   override hierarchy matching how ~#:byte-order~ already works.
-
-** Design
-
-*** Override hierarchy (most specific wins)
-    1. *Global default*: MSB-first (matches network convention)
-    2. *Per-protocol*: ~#:bit-order msb~ or ~#:bit-order lsb~ on ~struct/wire~
-    3. *Per-group*: ~#:bit-order~ on the first field of a bitfield group
-       (applies to the entire contiguous group)
-    4. *Per-field*: ~#:bit-order~ on an individual bit-unit field
-
-*** Syntax
-    #+begin_src racket
-    ;; Protocol-level default
-    (struct/wire usb-descriptor
-      #:byte-order little
-      #:bit-order lsb
-      (ep-number  uint 4 #:unit bits)
-      (reserved   uint 3 #:unit bits)
-      (direction  uint 1 #:unit bits)
-      ...)
-
-    ;; Per-field override within an MSB-default protocol
-    (struct/wire mixed-bits
-      #:byte-order big
-      (msb-field  uint 4 #:unit bits)
-      (lsb-field  uint 4 #:unit bits #:bit-order lsb))
-    #+end_src
-
-*** Encoding
-    - MSB-first (current): bits shift left, fill from high bit
-    - LSB-first: bits shift right, fill from low bit
-    - Within a bitfield group, all fields must agree on bit order
-      (or be explicitly overridden). Mixed bit orders within a single
-      byte require explicit field-level annotation.
-
-*** Impact
-    - ~field-desc~ gains ~#:bit-order~ (default ~#f~ = inherit)
-    - Bitfield group collection resolves effective bit order per group
-    - Encode/decode bit accumulation direction depends on bit order
-    - Existing code unchanged (MSB-first remains the default)
-
-** Implementation Steps [4/4]
-
-*** DONE Step 1: ~#:bit-order~ in field-desc
-    - field-desc gains bit-order field (~'msb~, ~'lsb~, or ~#f~ for inherit)
-    - ~bit-order?~ predicate
-    - Validation: only allowed on bit-unit fields
-
-*** DONE Step 2: Bitfield group bit-order resolution
-    - Groups split on bit-order change (not just byte/bit boundary)
-    - ~resolve-group-bit-order~ determines effective order per group
-    - Protocol validation accounts for bit-order splits
-    - struct/wire resolves field > protocol > global default (msb)
-
-*** DONE Step 3: LSB-first encoding and decoding
-    - Encode: accumulate bits from low bit upward
-    - Decode: extract bits from low bit position
-    - ~decode-bitfield~ gains ~#:bit-order~ parameter
-    - Both static and dynamic accessors pass bit-order through
-
-*** DONE Step 4: Tests
-    - MSB groups, LSB groups, mixed MSB/LSB in one protocol
-    - struct/wire with ~#:bit-order lsb~ at protocol level
-    - Round-trip tests for LSB bitfields
-    - 245 tests passing
-
-* v0.9 — Alignment and Padding
-
-** Goal
-   Support alignment constraints and explicit padding, so fields can
-   be aligned to byte, word (16-bit), dword (32-bit), or arbitrary
-   boundaries. Many protocols require fields to start at aligned
-   offsets, with padding bytes inserted between fields.
-
-** Design
-
-*** Alignment declaration
-    #+begin_src racket
-    (struct/wire aligned-msg
-      #:byte-order big
-      #:alignment 4               ; default: align fields to 4-byte boundaries
-      (tag    uint 1)
-      (pad    padding 3)          ; explicit padding (3 bytes)
-      (value  uint 4)
-      (short  uint 2)
-      (auto   padding #:align 4)  ; auto-pad to next 4-byte boundary
-      (data   uint 4))
-    #+end_src
-
-*** Padding field type
-    A new field type ~'padding~ that:
-    - Encodes as zero bytes
-    - Decodes as ignored bytes (not included in accessors)
-    - Can have a fixed width or ~#:align N~ to auto-compute width
-
-*** Auto-alignment
-    ~(padding #:align N)~ computes the number of padding bytes needed
-    to bring the current offset to the next N-byte boundary.
-    Width = ~(N - (current-offset mod N)) mod N~.
-
-*** Protocol-level alignment
-    ~#:alignment N~ on ~struct/wire~ inserts implicit padding before
-    each field to align it to an N-byte boundary. Individual fields
-    can opt out with ~#:no-align~.
-
-** Implementation Steps [3/4]
-
-*** DONE Step 1: Padding field type
-    - ~'padding~ added to valid field types
-    - Encode as zeros, decode as skip (not in result hash)
-    - struct/wire: no accessor or keyword arg generated for padding
-    - Tests: explicit fixed-width padding
-
-*** DONE Step 2: Auto-alignment padding
-    - ~(padding #:align N)~ computes width at compile time from static offset
-    - Zero padding dropped (field removed if already aligned)
-    - Handles bitfield group boundaries before alignment
-    - Tests: 4-byte alignment with various preceding field sizes
-
-*** DONE Step 3: Protocol-level ~#:alignment~
-    - ~#:alignment N~ on struct/wire auto-inserts ~(padding #:align N)~
-      before each non-first, non-padding field
-    - Compile-time injection, resolved to fixed widths
-
-*** DONE Step 4: Tests
-    - Explicit padding in codec and struct/wire
-    - Auto-alignment with 4-byte boundaries
-    - Decode correctly offsets through padding
-    - 255 tests passing
-
-* v0.10 — Conditional Presence
-
-** Goal
-   Support fields that are present or absent based on the value of
-   another field. ACN calls this ~present-when~. Essential for
-   protocols where optional fields or variant structures depend on
-   flags or type indicators.
-
-** Design
-
-*** Conditional field declaration
-    #+begin_src racket
-    (struct/wire optional-msg
-      #:byte-order big
-      (flags    uint 1)
-      (payload  uint 4 #:present-when (λ (fields) (bitwise-bit-set? (fields 'flags) 0)))
-      (extra    uint 2 #:present-when (λ (fields) (bitwise-bit-set? (fields 'flags) 1))))
-    #+end_src
-
-    ~#:present-when~ takes a predicate over a lookup function.
-    At decode time, if the predicate returns ~#f~, the field is
-    skipped (not decoded, accessor returns ~#f~ or a sentinel).
-
-*** Encoding
-    - If a field's presence predicate evaluates to ~#f~ based on the
-      provided values, the field is not encoded (zero bytes).
-    - The presence predicate is evaluated against the encode values hash.
-
-*** Decoding
-    - Fields decoded sequentially. When a conditional field is reached,
-      the predicate is evaluated against already-decoded fields.
-    - If absent: offset does not advance, accessor returns ~#f~.
-
-*** Impact on variable-length
-    Conditional fields are implicitly variable-length (0 or full width).
-    Total size depends on which fields are present.
-
-** Implementation Steps [4/4]
-
-*** DONE Step 1: ~#:present-when~ in field-desc
-    - field-desc gains optional presence predicate (~field-desc-present-when~, ~field-desc-conditional?~)
-    - struct/wire parses ~#:present-when expr~
-
-*** DONE Step 2: Conditional encoding
-    - Evaluate presence predicate against values hash
-    - Skip encoding absent fields (0 bytes)
-    - Total size computed dynamically for conditional protocols
-    - Contract validation skips absent fields
-
-*** DONE Step 3: Conditional decoding
-    - Evaluate predicate against decoded-so-far
-    - Absent fields: offset unchanged, accessor returns #f
-    - Boundary vector stores ~'absent~ marker for absent fields
-
-*** DONE Step 4: Tests
-    - Flags-based optional fields in codec and struct/wire
-    - Encode with present/absent, decode with present/absent
-    - Fields after conditional correctly offset
-    - 269 tests passing
-
-* v0.11 — Encoding Variants
-
-** Goal
-   Support field encoding schemes beyond raw unsigned/signed integers
-   and ASCII strings. ACN can specify BCD, IEEE 754 floats, and
-   other encodings on a per-field basis.
-
-** Design
-
-*** New field types / encoding annotations
-    #+begin_src racket
-    (struct/wire sensor-reading
-      #:byte-order big
-      (temperature float32 4)            ; IEEE 754 single-precision
-      (humidity    float64 8)            ; IEEE 754 double-precision
-      (bcd-value  bcd     2)            ; Binary-coded decimal
-      (flags      bool    1)            ; Boolean (0 = #f, nonzero = #t)
-      )
-    #+end_src
-
-*** Type catalog
-    | Type      | Width  | Encoding                               |
-    |-----------+--------+----------------------------------------|
-    | ~uint~    | N      | Unsigned integer (existing)             |
-    | ~sint~    | N      | Signed two's complement (existing)      |
-    | ~alpha~   | N      | ASCII, space-padded (existing)          |
-    | ~octets~  | N      | Raw bytes (existing)                    |
-    | ~float32~ | 4      | IEEE 754 single-precision               |
-    | ~float64~ | 8      | IEEE 754 double-precision               |
-    | ~bcd~     | N      | Binary-coded decimal (packed)           |
-    | ~bool~    | 1      | Boolean: 0 → #f, nonzero → #t          |
-
-*** Extensible type system
-    Rather than hardcoding all types, provide a way to register
-    custom encoders/decoders:
-    #+begin_src racket
-    (define-field-type float32
-      #:width 4
-      #:encode (λ (val buf offset order) ...)
-      #:decode (λ (buf offset order) ...))
-    #+end_src
-
-** Implementation Steps [3/3]
-
-*** DONE Step 1: New field types
-    - Added float32, float64, bcd, bool to valid field types
-    - No extensible registry yet — types added directly to codec
-    - Can extract registry later if custom types are needed
-
-*** DONE Step 2: IEEE 754 float types
-    - float32: 4-byte single-precision via Racket's floating-point-bytes
-    - float64: 8-byte double-precision, both big and little endian
-    - Tests: known values, round-trip, byte-order variants
-
-*** DONE Step 3: BCD and boolean types
-    - bcd: packed BCD (two digits per byte), zero-padded
-    - bool: 1 byte, 0→#f, nonzero→#t
-    - Tests: encode/decode, round-trip, edge cases
-    - 284 tests passing
-
-* v0.12 — String Encodings
-
-** Goal
-   Support string fields with encodings beyond Latin-1: UTF-8, UTF-16
-   (big and little endian), UTF-32, and null-terminated strings.
-
-** Design
-
-*** Encoding annotation
-    #+begin_src racket
-    (struct/wire unicode-msg
-      #:byte-order big
-      (label      utf8    20)                ; UTF-8, fixed 20 bytes
-      (wide-name  utf16   40)                ; UTF-16, fixed 40 bytes
-      (c-string   alpha   256 #:terminator 0); null-terminated, max 256 bytes
-      )
-    #+end_src
-
-*** String field types
-    | Type    | Encoding | Padding         | Terminator |
-    |---------+----------+-----------------+------------|
-    | ~alpha~ | Latin-1  | Space (0x20)    | None       |
-    | ~utf8~  | UTF-8    | Null (0x00)     | None       |
-    | ~utf16~ | UTF-16   | Null (0x0000)   | None       |
-    | ~utf32~ | UTF-32   | Null (0x000000) | None       |
-
-*** Null-terminated strings
-    ~#:terminator byte-value~ on any string type:
-    - Encode: write string + terminator, pad remainder with zeros
-    - Decode: read until terminator or field width, return string
-
-*** Variable-length strings
-    Combined with ~field-ref~ / ~compute~:
-    #+begin_src racket
-    (struct/wire length-prefixed-string
-      (len  uint 2)
-      (text utf8 (field-ref len)))
-    #+end_src
-
-** Implementation Steps [0/4]
-
-*** DONE Step 1: UTF-8 string type
-    - Encode: string→UTF-8 bytes, null-padded to width
-    - Decode: UTF-8 bytes→string, trim trailing nulls
-    - Tests: ASCII, multi-byte (café), round-trip
-
-*** DONE Step 2: UTF-16
-    - Byte-order-aware encoding (big/little endian)
-    - Null-padded, null-terminated on decode
-    - Tests: BMP characters, round-trip
-
-*** DONE Step 3: UTF-32 and null-terminated strings
-    - UTF-32: byte-order-aware, null-terminated on decode
-    - ~#:terminator byte-value~ on alpha fields: encode writes terminator
-      after string, decode scans for terminator byte
-
-*** DONE Step 4: Tests
-    - 290 tests passing
-
-* v0.13 — Enumerated Types
-
-** Goal
-   Support named value sets for integer fields, mapping between
-   symbolic names and wire values. Provides readability and
-   type safety.
-
-** Design
-
-*** Enum declaration
-    #+begin_src racket
-    (define-wire-enum ip-protocol
-      [tcp    6]
-      [udp   17]
-      [icmp   1])
-
-    (struct/wire ipv4-header
-      #:byte-order big
-      ...
-      (protocol  ip-protocol 1)
-      ...)
-    #+end_src
-
-*** Encoding
-    - Accept either the symbol (~'tcp~) or the integer (~6~)
-    - Encode as the integer value
-
-*** Decoding
-    - Decode the integer, look up the symbol
-    - Return the symbol if known, the raw integer if unknown
-
-*** Interaction with dispatch
-    Enum values can be used in ~define-dispatch~ tables:
-    #+begin_src racket
-    (define-dispatch ip-payload
-      #:offset 9 #:width 1 #:type ip-protocol
-      [(tcp) tcp-header]
-      [(udp) udp-header])
-    #+end_src
-
-** Implementation Steps [0/3]
-
-*** DONE Step 1: ~define-wire-enum~ macro (~wirey/enum.rkt~)
-    - ~wire-enum~ struct with bidirectional hash tables
-    - ~wire-enum-ref~: symbol→integer (encode), pass-through for integers
-    - ~wire-enum-lookup~: integer→symbol (decode), pass-through for unknown
-    - ~wire-enum-entries~: list of all (symbol . integer) pairs
-
-*** DONE Step 2: Tests
-    - ip-protocol enum (tcp, udp, icmp)
-    - ethertype enum (ipv4, ipv6, arp)
-    - Encode symbols, decode integers, unknown values
-    - 297 tests passing
-
-*** DONE Step 3: struct/wire integration
-    - ~#:enum enum-name~ on struct/wire fields
-    - Encode: auto-applies ~wire-enum-ref~ to convert symbols to integers
-    - Decode: auto-applies ~wire-enum-lookup~ to convert integers to symbols
-    - Works for both static and dynamic (variable-length) accessors
-
-* v0.14 — Repetition and Arrays
-
-** Goal
-   Support repeated fields: fixed-count arrays, count-prefixed arrays,
-   and delimiter-terminated sequences. Essential for protocols with
-   repeated sub-structures (e.g., DNS resource records, TLV sequences).
-
-** Design
-
-*** Array declaration
-    #+begin_src racket
-    (struct/wire dns-header
-      #:byte-order big
-      (id          uint 2)
-      (flags       uint 2)
-      (qd-count    uint 2)
-      (an-count    uint 2)
-      (ns-count    uint 2)
-      (ar-count    uint 2))
-
-    (struct/wire dns-message
-      #:byte-order big
-      (header    dns-header 1)                          ; embedded struct
-      (questions dns-question (repeat (field-ref header qd-count))))
-    #+end_src
-
-*** Repetition forms
-    | Form | Meaning |
-    |------+---------|
-    | ~(repeat N)~ | Fixed count |
-    | ~(repeat (field-ref name))~ | Count from another field |
-    | ~(repeat-until terminator-pred)~ | Until predicate matches |
-
-*** Embedded structs
-    A field whose type is another ~struct/wire~ name:
-    - Encode: call the inner struct's encode
-    - Decode: call the inner struct's decode at current offset
-    - Accessor returns the inner struct instance
-
-*** Array result
-    Decoded arrays return a list of struct instances.
-    Accessors on array fields return lists.
-
-** Implementation Steps [3/5]
-
-*** DONE Step 1: Embedded struct fields
-    - ~(field struct-name #:struct)~ syntax in struct/wire
-    - Encode accepts pre-encoded bytes for embedded field
-    - Decode accessor returns inner struct instance
-    - Width resolved at runtime from inner struct's protocol-desc
-
-*** DONE Step 2: Fixed-count repetition
-    - ~#:repeat N~ on field-desc produces a list of N values
-    - Encode takes a list, encodes each element at element width
-    - Decode reads N elements into a list
-    - Tests: fixed-count uint16 and uint32 arrays
-
-*** DONE Step 3: Count-prefixed repetition
-    - ~#:repeat (field-ref name)~ uses decoded count field for repeat count
-    - Encode and decode resolve count from values/decoded hash
-    - Total size accounts for repeated fields
-    - Tests: count-prefixed arrays
-
-*** DONE Step 4: Delimiter-terminated repetition
-    - ~#:repeat-until predicate~ on field-desc
-    - Encode: write all elements + zero-valued sentinel
-    - Decode: read elements until predicate returns true, consume sentinel
-
-*** DONE Step 5: Tests
-    - 316 tests passing
-
-* v0.15 — Default Values
-
-** Goal
-   Support default values for fields, used when encoding if no value
-   is provided. Reduces boilerplate for fields that are almost always
-   the same (version numbers, magic bytes, reserved fields).
-
-** Design
-
-*** Default declaration
-    #+begin_src racket
-    (struct/wire ipv4-header
-      #:byte-order big
-      (version  uint 4 #:unit bits #:default 4)
-      (ihl      uint 4 #:unit bits #:default 5)
-      ...
-      (reserved uint 3 #:unit bits #:default 0))
-    #+end_src
-
-*** Encoding
-    - Fields with defaults become optional keyword arguments
-    - If omitted, the default value is used
-    - If provided, the provided value is used (and validated against contract)
-
-*** Decoding
-    - Defaults have no effect on decoding (always read from bytes)
-
-** Implementation Steps [0/3]
-
-*** DONE Step 1: ~#:default~ in struct/wire
-    - struct/wire parses ~#:default expr~ in field clauses
-    - Fields with defaults generate optional keyword args with default values
-
-*** DONE Step 2: Optional keyword args in encode
-    - Omitted defaulted fields use the default value
-    - Provided values override defaults
-    - Tests: omit all defaults, override some, override all
-
-*** DONE Step 3: Tests
-    - 300 tests passing
-
-* Self-Describing Format Support
-
-  wirey aims to be a complete specification language for all binary wire
-  formats. The following extensions close the gap for self-describing
-  recursive formats like CBOR, ASN.1 BER/DER, Protocol Buffers, and
-  MessagePack.
-
-* v1.1 — Case Dispatch Within a Struct
-
-** Goal
-   Select among different field layouts based on a previously decoded
-   field's value. This is the intra-struct equivalent of ~define-dispatch~.
-   Required for CBOR's major-type/additional-info branching, ASN.1 BER
-   tag-driven structure, and Protocol Buffers wire types.
-
-** Design
-
-*** Syntax
-    #+begin_src racket
-    (struct/wire cbor-item
-      #:byte-order big
-      (major-type       uint 3 #:unit bits)
-      (additional-info  uint 5 #:unit bits)
-      (#:case additional-info
-        [((λ (v) (<= v 23)))
-         ;; Value is inline — no extra fields
-         ]
-        [(24)
-         (value uint 1)]
-        [(25)
-         (value uint 2)]
-        [(26)
-         (value uint 4)]
-        [(27)
-         (value uint 8)]))
-    #+end_src
-
-*** Semantics
-    - ~#:case field-name~ introduces a case block after a discriminator field
-    - Each branch ~[(predicate-or-value) field-spec ...]~ adds fields
-      conditionally based on the discriminator's decoded value
-    - Branches are tried in order; the first match wins
-    - Values can be exact matches or predicate functions
-    - Only one branch is active at a time
-    - Fields in the active branch are accessible by name
-    - Fields in inactive branches return ~#f~
-
-*** Encoding
-    - The encoder determines which branch to use by examining the
-      discriminator value in the provided keyword args
-    - Only the active branch's fields are encoded
-
-*** Decoding
-    - After decoding the discriminator, evaluate branch predicates
-    - Decode only the matching branch's fields
-    - Non-matching branches' fields return ~#f~ from accessors
-
-*** Impact
-    - This generalizes ~#:present-when~ (which is a binary case)
-    - Multiple ~#:case~ blocks can appear in one struct
-    - Branches can contain nested ~#:case~ blocks (for multi-level dispatch)
-
-** Implementation Steps [5/5]
-
-*** DONE Step 1: Case block parsing in struct/wire
-*** DONE Step 2: Case-aware encoding
-*** DONE Step 3: Case-aware decoding
-*** DONE Step 4: Accessor and match generation
-*** DONE Step 5: Tests
-
-* v1.2 — Recursive Types
-
-** Goal
-   Allow wire structs to reference themselves or other wire structs as
-   repeated element types. Required for CBOR arrays (which contain CBOR
-   items), ASN.1 constructed types, Protocol Buffers nested messages,
-   and any TLV format where the value is itself a TLV structure.
-
-** Design
-
-*** Recursive field references
-    #+begin_src racket
-    (struct/wire cbor-item
-      #:byte-order big
-      (major-type       uint 3 #:unit bits)
-      (additional-info  uint 5 #:unit bits)
-      (#:case major-type
-        [(4)  ;; Array
-         (items cbor-item #:repeat (decoded-value additional-info) #:struct)]
-        [(5)  ;; Map
-         (pairs cbor-map-entry #:repeat (decoded-value additional-info) #:struct)]
-        ...))
-    #+end_src
-
-*** Self-referencing types
-    - A struct/wire can reference its own name in a field type
-    - Decoded recursively: each nested instance is decoded at the
-      appropriate offset, producing a tree of struct instances
-    - The recursion terminates when a non-recursive branch is reached
-      (e.g., CBOR integer, string, or simple value)
-
-*** Representation
-    - Decoded recursive structures are trees of wire struct instances
-    - Accessors on array fields return lists of wire struct instances
-    - Tree depth is bounded by the data (not by the type definition)
-
-*** Encoding recursive values
-    - Accept nested Racket structures (lists of structs, etc.)
-    - Or accept pre-encoded bytes for leaves
-    - Encode depth-first
-
-*** Impact
-    - ~#:struct~ already handles embedded structs
-    - ~#:repeat~ already handles arrays of fixed types
-    - Combining them enables ~#:repeat~ of ~#:struct~ fields
-    - Self-reference is the new capability
-
-** Implementation Steps [0/4]
-
-*** DONE Step 1: Repeated struct fields
-*** DONE Step 2: Self-referencing types
-*** DONE Step 3: Variable-count recursive repetition
-*** DONE Step 4: Tests and CBOR definition
-
-* v1.3 — CBOR Specification
-
-** Goal
-   Define CBOR (RFC 8949) completely in wirey, as a proof that the
-   language can describe self-describing recursive formats.
-
-** Design
-   CBOR requires the features from v1.1 (case dispatch) and v1.2
-   (recursive types). The specification consists of:
-
-   1. ~cbor-head~ — initial byte (major type + additional info)
-   2. ~cbor-value~ — multi-way case dispatch for value encoding
-   3. ~cbor-item~ — combines head + value, recursive for compound types
-   4. ~cbor-array~ — repeated cbor-item
-   5. ~cbor-map~ — repeated key-value pairs of cbor-items
-
-** Implementation Steps [0/3]
-
-*** DONE Step 1: CBOR simple types (integers, byte strings, text strings)
-*** DONE Step 2: CBOR compound types (arrays, maps)
-*** DONE Step 3: CBOR special values (tags, simple values, floats)
-    - Includes indefinite-length encoding with break sentinel
-    - Full RFC 8949 Appendix A test vectors
-    - NOTE: Implemented as hand-written codec, not via struct/wire DSL.
-      This was identified as a failure — see v2.0 below.
-
-* The CBOR Problem
-
-  v1.3 implemented CBOR as a hand-written encoder/decoder that uses
-  wirey's codec primitives directly. This proves the primitives are
-  useful building blocks, but it does NOT prove that wirey's DSL can
-  describe self-describing recursive formats.
-
-  The goal was always that wirey should be a complete specification
-  language. If CBOR cannot be expressed through ~struct/wire~, the
-  language is incomplete. The hand-written CBOR module should be
-  replaced by a ~struct/wire~ definition.
-
-** What CBOR needs from ~struct/wire~ that doesn't work today
-
-   Target definition:
-   #+begin_src racket
-   (struct/wire cbor-item
-     #:byte-order big
-     (major-type       uint 3 #:unit bits)
-     (additional-info  uint 5 #:unit bits)
-     (#:case additional-info
-       [((λ (v) (<= v 23)))]
-       [(24) (argument uint 1)]
-       [(25) (argument uint 2)]
-       [(26) (argument uint 4)]
-       [(27) (argument uint 8)])
-     (#:case major-type
-       [(0)] [(1)]
-       [(2) (payload octets (field-ref argument))]
-       [(3) (payload octets (field-ref argument))]
-       [(4) (items cbor-item
-              #:repeat (field-ref argument) #:struct)]
-       [(5) (pairs cbor-item
-              #:repeat (compute (* 2 (field-ref argument)))
-              #:struct)]
-       [(6) (content cbor-item #:struct)]
-       [(7)]))
-   #+end_src
-
-*** Gap 1: Variable-length fields inside ~#:case~ branches
-    Today, ~#:case~ branch fields are parsed as normal field clauses,
-    but the codec path for case-block protocols uses ~decode~ + ~hash-ref~.
-    The low-level ~decode~ handles variable-length fields (it evaluates
-    ~field-ref~ and ~compute~ width expressions). So the codec already
-    supports this — but the ~struct/wire~ macro doesn't pass ~field-ref~
-    width expressions through case branch parsing correctly.
-
-    *Fix*: Ensure ~parse-normal-field~ in case branches produces
-    field-descs with proper ~field-ref~/~compute~ widths, and that
-    the codec's case-block handling evaluates them.
-
-*** Gap 2: ~#:struct~ and ~#:repeat #:struct~ inside ~#:case~ branches
-    Today, ~#:struct~ and ~#:repeat ... #:struct~ are parsed as special
-    field clause patterns at the top level of ~struct/wire~. They are not
-    recognized inside ~#:case~ branch field lists because
-    ~parse-normal-field~ doesn't handle them.
-
-    *Fix*: Extend ~parse-normal-field~ (or the case branch parser)
-    to recognize ~#:struct~ and ~#:repeat ... #:struct~ patterns.
-    The accessor generation for case-block protocols already uses
-    ~decode~ + ~hash-ref~, so the codec needs to handle these field
-    types within case branches.
-
-*** Gap 3: Cross-case field references
-    CBOR has two ~#:case~ blocks in sequence. The second (~#:case major-type~)
-    references ~argument~ which is defined in a branch of the first
-    (~#:case additional-info~). This means:
-
-    - ~argument~ may or may not exist depending on which branch of the
-      first case was active
-    - When ~additional-info <= 23~, there is no ~argument~ field;
-      ~additional-info~ itself IS the argument
-    - The second case's ~(field-ref argument)~ must resolve to either
-      the explicit ~argument~ field or fall back to ~additional-info~
-
-    This is the hardest gap. It requires:
-    a. The codec to evaluate ~field-ref~ against the decoded hash,
-       which includes fields from active case branches
-    b. A way to express "use ~argument~ if present, else ~additional-info~"
-       — this could be a ~compute~ expression:
-       ~(compute (λ (lk) (or (lk 'argument) (lk 'additional-info))))~
-
-*** Gap 4: Recursive ~#:struct~ inside case branches
-    ~(content cbor-item #:struct)~ inside a case branch requires the
-    codec to call ~cbor-item-decode~ recursively. The self-reference
-    works at define time (Racket resolves it lazily in lambda bodies).
-    But the codec's case-block handling would need to recognize
-    embedded/repeated struct fields within branch field-descs and
-    invoke the appropriate decode functions.
-
-    Currently, embedded structs are handled at the ~struct/wire~ macro
-    level by generating custom accessors. For case-block protocols,
-    the accessor uses ~decode~ + ~hash-ref~. So the codec's ~decode~
-    function needs to handle embedded struct decoding within case
-    branches — which it currently doesn't.
-
-*** Gap 5: Indefinite-length encoding
-    CBOR's indefinite-length mode (~additional-info = 31~) uses a
-    break sentinel byte (~0xFF~) to terminate sequences. This is
-    similar to ~#:repeat-until~ but the repeated elements are
-    themselves ~cbor-item~ instances (variable-width, recursive).
-
-    This combines Gap 2 (repeated structs in case branches),
-    Gap 4 (recursive struct references), and ~#:repeat-until~.
-
-* v2.0 — Full-Power Case Branches
-
-** Goal
-   Make ~#:case~ branches support the full feature set of ~struct/wire~
-   fields: variable-length (~field-ref~, ~compute~), embedded structs
-   (~#:struct~), repeated structs (~#:repeat #:struct~), and
-   ~#:repeat-until #:struct~. This enables CBOR to be expressed
-   entirely through the DSL.
-
-** Design Principles
-   - The codec (~decode~/~encode~) is the ground truth. If the codec
-     can handle a feature, ~struct/wire~ should be able to generate it.
-   - Accessors for case-block protocols use ~decode~ + ~hash-ref~.
-     This means all features must work at the codec level within
-     case branches — the macro just needs to generate correct
-     field-descs and case-blocks.
-   - Self-referencing types work through lazy lambda captures.
-     The codec calls decode functions that are defined after the
-     protocol-desc is constructed.
-
-** Implementation Steps [0/8]
-
-*** TODO Step 1: Variable-length fields in case branches
-    - Ensure ~parse-normal-field~ handles ~(field-ref name)~ widths
-      in case branch field lists
-    - Ensure the codec's case-block decode evaluates length expressions
-      against the full decoded hash (including earlier case branch fields)
-    - Test: ~(#:case tag [(1) (data octets (field-ref len))])~ where
-      ~len~ is a field before the case block
-
-*** TODO Step 2: ~field-ref~ across case blocks
-    - When a ~field-ref~ names a field that exists in a case branch,
-      the codec must look it up in the decoded hash (which includes
-      active branch fields)
-    - When the referenced field is absent (inactive branch), the
-      ~field-ref~ should resolve to a default (e.g., the discriminator
-      value itself for CBOR's ~additional-info~/~argument~ pattern)
-    - Introduce ~(field-ref name #:default expr)~ or
-      ~(compute (λ (lk) (or (lk 'argument) (lk 'additional-info))))~
-    - Test: two sequential ~#:case~ blocks, second references first
-
-*** TODO Step 3: Embedded ~#:struct~ in case branches
-    - Extend case branch field parsing to recognize ~(name struct #:struct)~
-    - The codec's case-block decode must call the inner struct's decode
-      function when processing the branch
-    - For the encode direction, accept pre-encoded bytes
-    - Test: ~(#:case tag [(1) (inner some-struct #:struct)])~
-
-*** TODO Step 4: ~#:repeat #:struct~ in case branches
-    - Extend case branch field parsing to recognize
-      ~(name struct #:repeat expr #:struct)~
-    - The codec's case-block decode must call decode-repeated-struct
-    - Test: ~(#:case tag [(4) (items inner #:repeat (field-ref count) #:struct)])~
-
-*** TODO Step 5: Self-referencing ~#:struct~ in case branches
-    - Same as Step 3/4 but the struct references itself
-    - Verify lazy lambda capture works within case-block decode
-    - Test: ~(#:case tag [(6) (content self-type #:struct)])~
-
-*** TODO Step 6: ~#:repeat-until #:struct~ in case branches
-    - For indefinite-length CBOR items
-    - The codec's case-block decode calls decode until break sentinel
-    - Test: ~(#:case tag [(31) (items item #:repeat-until break? #:struct)])~
-
-*** TODO Step 7: CBOR via struct/wire
-    - Rewrite ~protocols/cbor.rkt~ using ~struct/wire~ with
-      full-power case branches
-    - Must pass all existing CBOR tests (RFC 8949 Appendix A vectors)
-    - Remove or deprecate the hand-written CBOR codec
-    - This is the proof that wirey is a complete specification language
-
-*** TODO Step 8: Review and document
-    - Update Scribble docs with CBOR as a worked example
-    - Document the full-power case branch semantics
-    - Update review.org to reflect the completed gap closure
-
-** Acceptance Criteria
-   The following ~struct/wire~ definition must produce a working CBOR
-   codec that passes all RFC 8949 Appendix A test vectors:
-
-   #+begin_src racket
-   (struct/wire cbor-item
-     #:byte-order big
-     (major-type       uint 3 #:unit bits)
-     (additional-info  uint 5 #:unit bits)
-     (#:case additional-info
-       [((λ (v) (<= v 23)))]
-       [(24) (argument uint 1)]
-       [(25) (argument uint 2)]
-       [(26) (argument uint 4)]
-       [(27) (argument uint 8)])
-     (#:case major-type
-       [(0)] [(1)]
-       [(2) (payload octets
-              (compute (λ (lk) (or (lk 'argument) (lk 'additional-info)))))]
-       [(3) (payload octets
-              (compute (λ (lk) (or (lk 'argument) (lk 'additional-info)))))]
-       [(4) (items cbor-item
-              #:repeat (compute (λ (lk) (or (lk 'argument) (lk 'additional-info))))
-              #:struct)]
-       [(5) (pairs cbor-item
-              #:repeat (compute (λ (lk) (* 2 (or (lk 'argument) (lk 'additional-info)))))
-              #:struct)]
-       [(6) (content cbor-item #:struct)]
-       [(7)]))
-   #+end_src
-
-   Note: This definition does not yet handle indefinite-length
-   encoding (~additional-info = 31~), which requires ~#:repeat-until~
-   with struct elements. That is addressed in Step 6 and would add
-   a branch to the ~additional-info~ case and corresponding branches
-   in the ~major-type~ case.
+* What wirey is
+
+  A Racket-native specification language for binary wire protocols.
+  Describes the wire format declaratively; generates encoders, decoders,
+  accessors, and match expanders from the description.
+
+  Must handle fixed-layout protocols (ITCH, IPv4, TCP) and
+  self-describing recursive formats (CBOR, ASN.1 BER) through the
+  same DSL.
+
+* Current situation
+
+  - 600 tests pass
+  - The feature set is broad: bitfields, variable-length, case dispatch,
+    recursion, computed fields, contracts, enums, padding, alignment,
+    defaults, 12 field types, protocol stacks, message dispatch, CBOR
+  - The implementation is structurally unsound: the macro bypasses its
+    own data-driven layer, carries a parallel representation (positional
+    lists), and has three accessor code paths that each support a
+    different subset of features
+  - There are no downstream users
+  - The protocol definitions (ITCH, IPv4, TCP, PCAP, CBOR) exist as
+    test fixtures to exercise the DSL, not as features of the project
+
+* What went wrong
+
+  The original design had two layers:
+  1. Data-driven: ~field-desc~, ~protocol-desc~ — the intermediate
+     representation
+  2. Macro: ~struct/wire~ — parses syntax, builds the IR, generates
+     code from it
+
+  In practice, the macro stopped using the IR. It parses syntax into
+  12-element positional lists, resolves alignment and widths on those
+  lists, and generates code directly from them. The protocol-desc is
+  produced as a side output, not as the central artifact that drives
+  code generation.
+
+  Result: every new feature required changes to 5+ places in a 940-line
+  macro, three accessor code paths, and the codec — all operating on
+  different representations of the same information.
+
+* Redesign principles
+
+** The data-driven layer is the intermediate representation
+
+   The macro's ONLY job is to parse ~struct/wire~ syntax into
+   ~protocol-desc~ (and related data structures). ALL code generation
+   — accessors, encode, decode, match expanders — derives from the
+   protocol-desc. The macro does not compute offsets, does not choose
+   accessor strategies, does not build encode formals. Those are
+   responsibilities of the code-generation layer, which operates
+   entirely on the data-driven IR.
+
+** One path, not three
+
+   There is one accessor implementation: decode the protocol-desc and
+   extract the field by name. No static-offset path. No boundary-vector
+   path. One path that handles all features. If performance matters
+   later, add caching at the decode level — don't duplicate the code
+   generation.
+
+** Encode and decode are symmetric
+
+   The wire structure describes both directions:
+   - Decode: bytes → field values (hash)
+   - Encode: field values (hash) → bytes
+
+   For self-describing formats, a value-mapping layer sits on top:
+   - Decode-value: bytes → Racket value
+   - Encode-value: Racket value → bytes
+
+   The ~#:encode~ and ~#:decode~ options on ~struct/wire~ provide
+   the value-mapping functions. The wire structure definition
+   (protocol-desc) handles the field-level encode/decode. These
+   are separate concerns.
+
+** field-desc uses named fields, not positional slots
+
+   Replace the 12-element positional list in the macro with a proper
+   struct or hash. Access by name (~field-info-compute~), not by
+   index (~(seventh info)~). Adding a new field option must not
+   require updating every place that creates or destructures the
+   representation.
+
+** The protocol-desc field list is homogeneous
+
+   Case blocks, embedded structs, and repeated structs are not
+   special markers jammed into a list of field-descs. They are
+   part of the protocol-desc's structure, represented cleanly
+   so that iteration does not require type-checking every element.
+
+   Options:
+   - A protocol-desc field list contains only field-descs; case
+     blocks are a separate structural element
+   - Or: a unified "protocol element" type that has variants for
+     field, case-block, padding, etc. — iterated with pattern
+     matching, not ~cond~ chains
+
+* Implementation plan
+
+  Since there are no downstream users, we can break the existing API
+  freely. The protocol definitions are test fixtures — they can be
+  rewritten as the DSL changes.
+
+** Phase 1: Rebuild the data-driven layer
+
+*** TODO Step 1: Clean IR for field descriptions
+    Replace the ~field-desc~ struct with a design that accommodates all
+    current features without positional overloading:
+    - Core: name, type, width, byte-order
+    - Units: byte or bit, with bit-order
+    - Options: compute, contract, present-when, default, terminator,
+      enum, repeat, repeat-until
+    - Width can be: integer, field-ref, compute
+    - Embedded/repeated struct references are explicit, not markers
+      stuffed into the type or enum slot
+
+*** TODO Step 2: Clean IR for protocol structure
+    A protocol-desc's content is a list of *elements*, where an element
+    is one of:
+    - ~field-element~: a single field-desc
+    - ~case-element~: a discriminator name + list of branches, each
+      branch containing a list of elements (recursive)
+    - ~padding-element~: explicit padding with width or alignment
+
+    This is a tree, not a flat list. The codec walks the tree.
+    No more type-checking each list item.
+
+*** TODO Step 3: Codec operates on the element tree
+    Rewrite ~encode~ and ~decode~ to walk the element tree:
+    - ~field-element~: encode/decode the field
+    - ~case-element~: evaluate discriminator, select branch, walk
+      its elements
+    - ~padding-element~: skip/zero bytes
+
+    One recursive walk function for each direction. No special-case
+    ~cond~ branches for case-blocks, padding, conditional, bitfields.
+    Bitfield groups are identified during the walk (contiguous
+    bit-unit fields) and handled as a unit.
+
+*** TODO Step 4: Verify protocol definitions still work
+    Rewrite the test fixtures (ITCH, IPv4, TCP, PCAP, CBOR) against
+    the new IR. All 600 existing tests should pass. Protocol
+    definitions may need syntax changes if the ~struct/wire~ surface
+    syntax changes.
+
+** Phase 2: Rebuild the macro
+
+*** TODO Step 5: Macro produces IR only
+    The ~struct/wire~ macro's output is:
+    1. A protocol-desc (the IR)
+    2. A predicate
+    3. An encode function (keyword args → bytes)
+    4. A decode function (bytes → instance)
+    5. Accessors (one per non-padding field)
+    6. A match expander
+    7. Optional: ~encode-value~ and ~decode-value~ (if ~#:encode~ /
+       ~#:decode~ provided)
+
+    The macro generates these by calling into a code-generation
+    library that operates on the protocol-desc. The macro itself is
+    small: it parses syntax and delegates.
+
+*** TODO Step 6: Code generation from IR
+    A library (not a macro) that takes a protocol-desc and generates
+    Racket definitions:
+    - Encode: walk the element tree, collect field values from the
+      hash, encode each element
+    - Decode: walk the element tree, decode each element, build the
+      result hash
+    - Accessors: decode + hash-ref (one path)
+    - Match: keyword-based, using accessors
+
+    This library can be tested independently of the macro.
+
+*** TODO Step 7: Macro field-info uses named representation
+    The macro's internal field-info is a struct or hash with named
+    fields, not a positional list. Adding a new field option is:
+    1. Add a slot to the field-info struct
+    2. Parse it in the syntax parser
+    3. Map it to the protocol-desc IR
+    No other changes needed.
+
+** Phase 3: Encode symmetry
+
+*** TODO Step 8: Inactive branch omission
+    When encoding a case-block protocol, ~#f~ values for fields in
+    inactive branches are automatically excluded. The encoder
+    determines the active branch from the discriminator value in the
+    hash, and only encodes that branch's fields.
+
+*** TODO Step 9: Value-level encode/decode as first-class
+    The ~#:encode~ and ~#:decode~ options remain as user-provided
+    value-mapping functions. The generated ~encode-value~ and
+    ~decode-value~ call them.
+
+    For protocols that can derive the mapping (fixed-layout protocols
+    where the field values ARE the Racket values), ~encode-value~ is
+    just ~encode~ with keyword args. For self-describing formats,
+    the user provides the mapping.
+
+** Phase 4: Verify completeness
+
+*** TODO Step 10: CBOR through the DSL
+    The ~struct/wire~ CBOR definition plus ~#:encode~ / ~#:decode~
+    value functions must pass all RFC 8949 test vectors. The value
+    functions should be significantly simpler than the current
+    wrappers because the DSL handles more.
+
+*** TODO Step 11: Clean up
+    - Remove the hand-written ~protocols/cbor.rkt~ (replaced by
+      ~cbor-wire.rkt~)
+    - Update Scribble documentation
+    - Update review.org
+    - Version bump
+
+* What we keep
+
+  - The test suite (600 tests) — these are the acceptance criteria
+  - The protocol definitions as test fixtures
+  - The ~struct/wire~ surface syntax (may evolve but stays recognizable)
+  - The separated modules: field, protocol, codec, syntax, stack,
+    dispatch, checksum, enum, case-block, length-expr
+  - The ~#:encode~ / ~#:decode~ value-level mechanism

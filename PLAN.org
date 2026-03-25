@@ -11,6 +11,18 @@
   self-describing recursive formats (CBOR, ASN.1 BER) through the
   same DSL.
 
+  *The project is a failure* if it cannot be used to implement all
+  of the following cleanly:
+  - CBOR (RFC 8949) — self-describing, recursive
+  - MessagePack — self-describing, recursive, similar to CBOR
+  - BSON — length-prefixed documents with type tags
+  - ITCH 5.0 with full network stack (Ethernet → IPv4 → UDP →
+    MoldUDP64 → ITCH message dispatch)
+
+  "Cleanly" means: through the DSL, not through hand-written codecs
+  that happen to live in the repo. The protocol definition should
+  read like a specification, not like imperative Racket code.
+
 * Current situation
 
   - 600 tests pass
@@ -205,17 +217,33 @@
 
 ** Phase 4: Verify completeness
 
-*** TODO Step 10: CBOR through the DSL
-    The ~struct/wire~ CBOR definition plus ~#:encode~ / ~#:decode~
-    value functions must pass all RFC 8949 test vectors. The value
-    functions should be significantly simpler than the current
-    wrappers because the DSL handles more.
+*** TODO Step 10: Acceptance tests — all four targets
+    The redesign is complete when all four target protocols can be
+    expressed cleanly through the DSL:
+
+    1. *CBOR (RFC 8949)*: self-describing, recursive, 8 major types,
+       variable-length arguments, indefinite-length encoding.
+       Must pass all RFC 8949 Appendix A test vectors.
+
+    2. *MessagePack*: similar to CBOR — type byte + payload.
+       Integers, strings, binary, arrays, maps, nil, booleans.
+       Must round-trip all MessagePack types.
+
+    3. *BSON*: length-prefixed documents, type-tagged elements,
+       embedded documents. Must round-trip basic documents.
+
+    4. *ITCH 5.0 full stack*: Ethernet → IPv4 → UDP → MoldUDP64 →
+       ITCH message dispatch (all 23 message types). Must decode
+       a raw packet from Ethernet frame to ITCH field values.
+
+    "Clean" means the protocol definition reads like a specification.
+    If the definition requires hand-written Racket code beyond the
+    ~#:encode~ / ~#:decode~ value-mapping functions, the DSL has a gap.
 
 *** TODO Step 11: Clean up
-    - Remove the hand-written ~protocols/cbor.rkt~ (replaced by
-      ~cbor-wire.rkt~)
+    - Remove the hand-written ~protocols/cbor.rkt~
     - Update Scribble documentation
-    - Update review.org
+    - Update review.org and CBOR.org
     - Version bump
 
 * What we keep

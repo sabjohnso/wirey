@@ -23,6 +23,13 @@
   that happen to live in the repo. The protocol definition should
   read like a specification, not like imperative Racket code.
 
+  More broadly: anything that can be implemented with ASN.1 + ACN
+  should be implementable with wirey. ASN.1 provides the type system
+  (integers, strings, sequences, choices, tagged types, recursive
+  types). ACN provides the encoding annotations (bit/byte order,
+  field sizes, alignment, endianness, encoding rules). wirey must
+  cover both roles in a single Racket-native DSL.
+
 * Current situation
 
   - 600 tests pass

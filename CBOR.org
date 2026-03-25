@@ -1,327 +1,233 @@
-#+TITLE: CBOR Encoding Gap Analysis
+#+TITLE: CBOR: Gap Analysis and Redesign Plan
 #+STARTUP: showall
 
-* Problem Statement
+* Current State
 
-  The ~struct/wire~ definition for CBOR (~cbor-wire-item~) handles
-  decoding correctly — the wire data drives branch selection. But
-  encoding requires hand-written wrapper functions that the DSL
-  should be able to derive from the spec.
+  CBOR works. 600 tests pass. Both encode and decode function correctly.
+  But the implementation reveals structural problems in wirey that made
+  it far harder than it should have been.
 
-  Each wrapper function exists because ~struct/wire~ cannot currently
-  deduce some aspect of encoding from the wire structure definition.
-  This document identifies what's missing in the DSL for each function.
+  Two CBOR implementations exist:
+  - ~protocols/cbor.rkt~ — hand-written codec (v1.3), works but doesn't
+    use the DSL
+  - ~protocols/cbor-wire.rkt~ — ~struct/wire~ definition (v2.0) with
+    hand-written ~#:encode~ / ~#:decode~ value-mapping functions
 
-* Function-by-function analysis
+  The struct/wire definition proves the DSL can describe CBOR's wire
+  format. The hand-written value functions prove the DSL cannot yet
+  handle the encode direction without help.
 
-** ~argument->ai+ext~ — Discriminator derivation from argument magnitude
+* Pain Points from Implementation
 
-   #+begin_src racket
-   (define (argument->ai+ext arg)
-     (cond
-       [(<= arg 23)         (values arg #f)]
-       [(<= arg #xFF)       (values 24 arg)]
-       [(<= arg #xFFFF)     (values 25 arg)]
-       [(<= arg #xFFFFFFFF) (values 26 arg)]
-       [else                (values 27 arg)]))
-   #+end_src
+  These are the actual problems encountered while building CBOR
+  support, not hypothetical issues.
 
-*** What it does
-    Maps an argument value to the ~additional-info~ discriminator and
-    optional ~ext-arg~ field. This is the "shortest encoding" rule:
-    use the smallest wire representation that can hold the value.
+** Pain 1: ~syntax.rkt~ is a monolith (940+ lines)
 
-*** Why the DSL can't deduce it
-    The ~#:case additional-info~ block defines which branch to take
-    given a discriminator *value*, but not how to *derive* the
-    discriminator value from the data being encoded. The relationship
-    is implicit in the branch structure:
+   Every new feature required touching 5+ places in the same file:
+   field clause parsing, alignment resolution, fd-expr generation,
+   encode formal generation, accessor generation (3 strategies),
+   match expander generation. A change in one area often broke another.
 
-    - Branch for AI ≤ 23: no ext-arg → the argument IS the AI value
-    - Branch for AI = 24: ext-arg is 1 byte → argument fits in uint8
-    - Branch for AI = 25: ext-arg is 2 bytes → argument fits in uint16
-    - etc.
+   The macro grew by accretion. Each feature (case blocks, repeated
+   structs, embedded structs, enums, defaults, alignment, compute,
+   contracts, present-when, terminators, bit-order) added conditionals
+   to every phase. The phases interact in ways that are hard to reason
+   about.
 
-    The DSL spec says "when AI is 24, ext-arg is 1 byte" (decode
-    direction). It does NOT say "when the value fits in 1 byte, use
-    AI=24" (encode direction). This inverse mapping is not expressed
-    anywhere in the ~struct/wire~ definition.
+*** Root cause
+    No intermediate representation. The macro goes directly from syntax
+    to generated code, carrying all information in positional lists
+    (12+ elements, accessed by numeric index). There is no data
+    structure that represents "the fully resolved protocol" between
+    parsing and code generation.
 
-*** What the DSL would need
-    A mechanism to derive discriminator values from content. Something
-    like:
+** Pain 2: Field info is a positional list
 
-    #+begin_src racket
-    (#:case additional-info
-      #:derive (λ (fields)
-                 (define arg (or (fields 'ext-arg) 0))
-                 (cond [(<= arg 23) arg] [(<= arg #xFF) 24] ...))
-      [((λ (v) (<= v 23)))]
-      [(24) (ext-arg uint 1)]
-      ...)
-    #+end_src
+   Field information is a list of 12 elements:
+   #+begin_example
+   (name type width byte-order unit bit-order compute contract
+    align present-when default enum)
+   #+end_example
 
-    Or equivalently, each branch could declare its encoding condition:
+   Accessed by ~(first info)~, ~(seventh info)~, ~(list-ref info 11)~.
+   Adding a new element means updating every place that creates,
+   destructures, or extends these lists — which is everywhere.
 
-    #+begin_src racket
-    [(24 #:when (λ (fields) (<= (fields 'ext-arg) #xFF)))
-     (ext-arg uint 1)]
-    #+end_src
+   Case blocks, embedded structs, and repeated structs store markers
+   in the type or enum positions using ~(list 'embedded ...)~ or
+   ~(list 'repeated-struct ...)~, overloading existing slots. This
+   creates fragile ~(and (pair? v) (eq? (car v) 'embedded))~ checks
+   scattered throughout the code.
 
-** ~encode-head~ — Shared encoding pattern
+*** Root cause
+    Should be a struct, not a list. Or better: a hash with named
+    fields that can be extended without breaking existing code.
 
-   #+begin_src racket
-   (define (encode-head major-type argument)
-     (define-values (ai ext) (argument->ai+ext argument))
-     (if ext
-         (cbor-wire-item-encode #:major-type major-type #:additional-info ai #:ext-arg ext)
-         (cbor-wire-item-encode #:major-type major-type #:additional-info ai)))
-   #+end_src
+** Pain 3: Three accessor strategies
 
-*** Why it exists
-    Encapsulates the conditional keyword argument pattern: when
-    ~ext-arg~ is ~#f~, it must be omitted from the keyword args
-    (since providing ~#:ext-arg #f~ would encode ~#f~ as zero bytes
-    rather than omitting the field entirely).
+   The macro has three code-generation paths for field accessors:
+   1. *Static*: compile-time byte offsets (fixed-width, no case blocks)
+   2. *Dynamic*: precomputed boundary vector (variable-width, no case)
+   3. *Case-driven*: full ~decode~ + ~hash-ref~ (case blocks or
+      repeated structs)
 
-*** What the DSL would need
-    Passing ~#f~ for a case-branch field should mean "this branch is
-    inactive — omit the field." Currently ~struct/wire~ treats ~#f~
-    as a value to encode. If inactive-branch fields were automatically
-    excluded when their discriminator doesn't select their branch,
-    this function would be unnecessary. The user would just pass all
-    fields and the system would filter based on the active branch.
+   Each path has its own code for handling enums, embedded structs,
+   bit-order, and variable-length fields. Bugs in one path don't
+   exist in the others. Features added to one path are forgotten in
+   the others.
 
-** ~cbor-wire-encode-unsigned~ — Major type selection
+*** Root cause
+    Premature optimization. The static and dynamic paths exist for
+    performance (avoid full decode when possible). But they triple the
+    code surface and make every feature change 3× harder. The
+    case-driven path (decode + hash-ref) is the only one that handles
+    all features correctly. The other two are optimized paths that
+    each support a subset.
 
-   #+begin_src racket
-   (define (cbor-wire-encode-unsigned n)
-     (encode-head 0 n))
-   #+end_src
+** Pain 4: Codec handles too many concerns
 
-*** Why it exists
-    Maps the semantic concept "unsigned integer" to ~major-type = 0~.
-    The user says "encode unsigned 42" and the function knows MT=0.
+   ~codec.rkt~ (622 lines) has a single ~encode~ function and a single
+   ~decode~ function that each handle: bitfields, variable-length,
+   conditional presence, case blocks, computed fields, contracts,
+   repeated fields, repeat-until, padding, 12 field types. Each concern
+   adds a ~cond~ branch to both functions.
 
-*** What the DSL would need
-    The relationship between semantic types and major-type values is
-    expressed in the ~#:case major-type~ block:
-    - ~[(0)]~ = unsigned int
-    - ~[(1)]~ = negative int
-    - etc.
+   Adding case-block support required guarding every existing ~cond~
+   branch against case-blocks: ~field-desc-unit~, ~field-desc-conditional?~,
+   ~collect-bitfield-group~, etc. all needed ~(field-desc? ...)~ guards
+   because case-blocks can appear in the same list as field-descs.
 
-    But this is decode-direction only. The DSL doesn't capture that
-    "when the user wants an unsigned integer, set major-type=0."
-    This is a variant of discriminator derivation: derive
-    ~major-type~ from which payload fields the user provides.
+*** Root cause
+    Mixed abstraction levels. The protocol-desc field list contains
+    both ~field-desc~ and ~case-block~ items, violating the expectation
+    that it's a homogeneous list. Every iteration over the list needs
+    to check types.
 
-    Since the MT=0 branch has no payload fields, the system can't
-    distinguish "unsigned int" from "negative int" by looking at
-    which fields are non-~#f~. Both branches are empty. The
-    distinction is purely semantic — it requires the user to express
-    intent ("I want an unsigned int") which is not part of the wire
-    structure.
+** Pain 5: Encode direction is an afterthought
 
-    *This is a fundamental limitation*: when multiple branches have
-    the same field structure (or no fields), the encode direction
-    cannot distinguish them without explicit semantic annotation.
+   The entire architecture is decode-first. The codec's ~decode~ is the
+   primary path; ~encode~ mirrors it. But for self-describing formats,
+   encode requires:
+   - Discriminator derivation (what case branch to take)
+   - Value transformation (negative integer → argument)
+   - Count inference (array length → repeat count)
+   - Inactive branch field omission (skip fields from wrong branches)
 
-** ~cbor-wire-encode-negative~ — Semantic transformation
+   None of these were designed into the system. They were added as
+   wrapper functions outside the DSL.
 
-   #+begin_src racket
-   (define (cbor-wire-encode-negative n)
-     (encode-head 1 (- -1 n)))
-   #+end_src
+*** Root cause
+    The DSL describes the wire format (bytes), not the value mapping
+    (Racket values ↔ bytes). Decode goes from bytes → fields → values.
+    Encode should go from values → fields → bytes. The middle step
+    (fields) exists for decode (it's the hash returned by ~decode~)
+    but not for encode (the user provides field values directly via
+    keyword args, or the ~#:encode~ function produces them).
 
-*** Why it exists
-    CBOR stores negative integers as ~-1 - argument~. The user
-    provides the actual negative integer (e.g., -42) and the function
-    transforms it to the wire representation (argument = 41).
+** Pain 6: Forward references and lazy evaluation
 
-*** What the DSL would need
-    A field-level value transformation for encoding. Something like:
+   Self-referencing types (CBOR items contain CBOR items) require lazy
+   lambda captures so the protocol-desc name is resolved after
+   definition. This works but creates subtle ordering dependencies:
+   ~(protocol-desc-total-size struct-name)~ fails during construction
+   but works inside a lambda body.
 
-    #+begin_src racket
-    [(1) #:encode-transform (λ (n) (- -1 n))
-         #:decode-transform (λ (arg) (- -1 arg))]
-    #+end_src
+   The ~compute~ width expressions carry ~#:data~ and ~#:offset~
+   magic keys through the lookup function to support
+   ~protocol-desc-total-size-at~ calls. This is a hack that leaks
+   implementation details into the compute function signature.
 
-    The wire structure specifies the encoding, but not the semantic
-    interpretation. The DSL only describes bytes, not meaning.
+*** Root cause
+    No clean abstraction for "size of a variable-width item at a given
+    position in the data." The system computes sizes in multiple ways:
+    ~protocol-desc-total-size~ (fixed portion), ~compute-decoded-size~,
+    ~compute-decoded-offset~, ~protocol-desc-total-size-at~. These
+    overlap and sometimes disagree for protocols with case blocks.
 
-** ~cbor-wire-encode-bytes~ and ~cbor-wire-encode-text~ — Length computation
+* What's NOT broken
 
-   These functions compute the payload length and derive the
-   argument from it.
+  - The field type system (uint, sint, float32, etc.) is clean
+  - The checksum, enum, dispatch, and stack modules are well-isolated
+  - The length-expr and case-block data structures are sound
+  - The test suite (600 tests) is comprehensive
+  - The protocol definitions (ITCH, IPv4, TCP, PCAP) work correctly
+  - The CBOR decode through struct/wire actually works
+  - The #:encode / #:decode value-level mechanism works
 
-*** Why they exist
-    The payload length IS the argument value. The user provides the
-    payload data, and the function computes:
-    1. ~argument = (bytes-length payload)~
-    2. ~(ai, ext-arg) = argument->ai+ext(argument)~
+* Encoding Analysis: Why Each Wrapper Exists
 
-*** What the DSL would need
-    A way to declare that a discriminator's value is derived from
-    another field's content:
-
-    #+begin_src racket
-    (additional-info uint 5 #:unit bits
-      #:derive-from (λ (fields)
-                      (let ([len (bytes-length (or (fields 'payload) (bytes)))])
-                        (cond [(<= len 23) len] [(<= len #xFF) 24] ...))))
-    #+end_src
-
-    This is the combination of two gaps:
-    1. Discriminator derivation (from ~argument->ai+ext~)
-    2. Argument derivation from payload length
-
-** ~cbor-wire-encode-array~ — Count from list length
-
-   Same pattern as bytes/text, but the argument is the count of
-   items rather than the byte length of a payload.
-
-*** What the DSL would need
-    The ~#:repeat~ expression ~(compute (λ (lk) (or ...)))~ defines
-    the decode-direction count. The inverse — "the count IS the
-    repeat value, and the discriminator is derived from it" — is not
-    expressed. A ~#:derive-count~ or similar mechanism would allow
-    the system to infer the argument from the number of items.
-
-** ~cbor-wire-encode-map~ — Count as half the list length
-
-   Maps store ~2 × count~ items (key-value pairs), but the argument
-   is the pair count, not the item count. The function divides by 2.
-
-*** What the DSL would need
-    Same as arrays, but the ~#:repeat~ expression includes a ~* 2~
-    multiplier. The inverse (divide by 2) should be derivable from
-    the forward expression if the DSL could invert simple arithmetic.
-
-** ~cbor-wire-encode-tag~ — Argument is the tag number
-
-   Trivial: the argument IS the tag number. Same pattern as
-   unsigned integers.
-
-** ~cbor-wire-encode-simple~ — Overloaded major type 7
-
-   #+begin_src racket
-   (define (cbor-wire-encode-simple sv)
-     (if (<= sv 23)
-         (cbor-wire-item-encode #:major-type 7 #:additional-info sv)
-         (cbor-wire-item-encode #:major-type 7 #:additional-info 24 #:ext-arg sv)))
-   #+end_src
-
-*** Why it exists
-    Same discriminator derivation as ~argument->ai+ext~, but only
-    for simple values (MT=7). The user provides the simple value and
-    the function determines AI.
-
-** ~cbor-wire-encode-float~ — Type coercion
-
-   #+begin_src racket
-   (define (cbor-wire-encode-float fv)
-     (define float-bytes (real->floating-point-bytes fv 8 #t))
-     (define raw-uint (for/fold ([acc 0]) ([b (in-bytes float-bytes)])
-                        (+ (* acc 256) b)))
-     (cbor-wire-item-encode #:major-type 7 #:additional-info 27 #:ext-arg raw-uint))
-   #+end_src
-
-*** Why it exists
-    Floats share MT=7 with simple values. The ~ext-arg~ field is
-    typed as ~uint~ in the wire structure, but floats need to store
-    IEEE 754 bytes in the same wire position. The function reinterprets
-    float bytes as a uint64.
-
-*** What the DSL would need
-    Per-branch field type overrides. The ~ext-arg~ field is ~uint~ in
-    the AI=24 branch but should be ~float64~ in the AI=27 branch
-    (for double-precision floats). Something like:
-
-    #+begin_src racket
-    (#:case additional-info
-      ...
-      [(27) (ext-arg float64 8)]   ;; when MT=7
-      [(27) (ext-arg uint 8)])     ;; when MT=0-6
-    #+end_src
-
-    But this creates a conflict: AI=27 can mean either uint64 or
-    float64 depending on major-type. This requires *nested* case
-    dispatch: the interpretation of AI=27 depends on both AI and MT
-    simultaneously. The current ~#:case~ system handles sequential
-    (independent) cases, not cross-dependent ones.
-
-* Summary of Missing DSL Features
-
-  | Gap | Wrapper functions affected | Difficulty |
-  |-----+----------------------------+------------|
-  | Discriminator derivation | All | Medium |
-  | Inactive branch field omission | encode-head | Low |
-  | Semantic value transforms | encode-negative, encode-float | Medium |
-  | Count derivation from repeat | encode-array, encode-map | Medium |
-  | Cross-case type overrides | encode-float | Hard |
-  | Identical-structure branch disambiguation | encode-unsigned vs encode-negative | Solved by Racket type |
+  Every hand-written function in ~cbor-wire.rkt~ exists because the
+  DSL cannot derive some aspect of encoding from the wire definition.
 
 ** There is no undecidable case
 
-   I previously claimed that MT=0 (unsigned) and MT=1 (negative)
-   are ambiguous because both branches have identical field structure
-   (no payload). This is wrong.
-
-   The user provides a Racket integer. The sign IS the discriminator:
-   - ~5~ → non-negative → MT=0, argument=5
-   - ~-6~ → negative → MT=1, argument=5 (because -1-5 = -6)
-
    Every Racket value has a unique CBOR encoding:
-   - Non-negative exact integer → MT=0
-   - Negative exact integer → MT=1
-   - Bytes → MT=2
-   - String → MT=3
-   - List → MT=4
-   - Association list / hash → MT=5
-   - Flonum → MT=7 (float)
-   - Boolean / void → MT=7 (simple)
+   - ~5~ (non-negative integer) → MT=0, argument=5
+   - ~-6~ (negative integer) → MT=1, argument=5
+   - ~(bytes 1 2 3)~ → MT=2, length=3
+   - ~"hello"~ → MT=3, length=5
+   - ~'(1 2 3)~ → MT=4, count=3
+   - ~(hash "a" 1)~ → MT=5, count=1
+   - ~1.1~ (flonum) → MT=7, AI=27
+   - ~#t~ → MT=7, AI=21
+   - ~#f~ → MT=7, AI=20
 
-   The wire representation is fully determined by the Racket value.
-   There are no decisions that cannot be made.
+   The Racket type determines the major type. The value magnitude
+   determines the argument. The argument determines additional-info.
+   The chain is fully deterministic.
 
-** What the DSL needs
+** What each function compensates for
 
-   A single mechanism: *~#:encode~ on ~struct/wire~* that maps Racket
-   values to wire field values. This is not per-branch — it is a
-   single function that takes a Racket value and produces the complete
-   set of field values for encoding:
+   | Function | What it does | DSL gap |
+   |----------+--------------+---------|
+   | ~argument->ai+ext~ | Shortest encoding rule | No inverse mapping from value to discriminator |
+   | ~encode-head~ | Conditional kwarg omission | ~#f~ means "encode zero" not "skip" |
+   | ~encode-unsigned~ | MT=0 selection | No Racket-type → discriminator mapping |
+   | ~encode-negative~ | ~-1-n~ transform | No per-branch value transform |
+   | ~encode-bytes~ | Length → argument | No "derive discriminator from content" |
+   | ~encode-text~ | UTF-8 + length → argument | Same as bytes |
+   | ~encode-array~ | Count → argument | No count inference from list length |
+   | ~encode-map~ | Count/2 → argument | No inverse of ~* 2~ in repeat expression |
+   | ~encode-tag~ | Tag number → argument | Same as unsigned |
+   | ~encode-simple~ | Same as argument->ai+ext | Same |
+   | ~encode-float~ | Float reinterpret as uint | No per-branch type override |
 
-   #+begin_src racket
-   (struct/wire cbor-wire-item
-     #:byte-order big
-     #:encode cbor-racket->fields
-     (major-type       uint 3 #:unit bits)
-     (additional-info  uint 5 #:unit bits)
-     ...)
-   #+end_src
+** The single missing mechanism
 
-   Where ~cbor-racket->fields~ is:
+   All of these reduce to one thing: the DSL needs a *value-to-fields*
+   mapping. The ~#:encode~ option on ~struct/wire~ provides this as an
+   escape hatch (user writes the mapping function). But ideally the DSL
+   would derive the mapping from the wire structure definition itself,
+   needing only the Racket-type → major-type table as input.
 
-   #+begin_src racket
-   (define (cbor-racket->fields v)
-     (cond
-       [(and (integer? v) (>= v 0))
-        (define-values (ai ext) (argument->ai+ext v))
-        (hasheq 'major-type 0 'additional-info ai 'ext-arg ext)]
-       [(and (integer? v) (< v 0))
-        (define-values (ai ext) (argument->ai+ext (- -1 v)))
-        (hasheq 'major-type 1 'additional-info ai 'ext-arg ext)]
-       [(bytes? v)
-        (define-values (ai ext) (argument->ai+ext (bytes-length v)))
-        (hasheq 'major-type 2 'additional-info ai 'ext-arg ext 'payload v)]
-       ...))
-   #+end_src
+* Redesign Direction
 
-   This is the inverse of decode: decode goes from bytes to Racket
-   values, encode goes from Racket values to bytes. Both directions
-   are deterministic.
+  The pain points suggest a redesign around three principles:
 
-   The wrapper functions in ~cbor-wire.rkt~ exist because this
-   ~#:encode~ mechanism does not yet exist. They are not evidence
-   of a fundamental limitation — they are evidence of a missing
-   feature.
+** Principle 1: Intermediate representation
+
+   Introduce a resolved protocol IR between parsing and code
+   generation. The macro parses syntax into IR, resolves alignment
+   and widths on the IR, then generates code from the IR. The IR
+   is a proper data structure (structs with named fields), not
+   positional lists.
+
+** Principle 2: One accessor path
+
+   Eliminate the static and dynamic accessor strategies. Use the
+   case-driven path (decode + hash-ref) for everything. If
+   performance matters later, add caching — but don't maintain
+   three code-generation paths.
+
+** Principle 3: Encode as first-class
+
+   Design encode and decode as symmetric operations from the start.
+   The wire structure definition should express both directions:
+   - Decode: bytes → field hash → Racket value
+   - Encode: Racket value → field hash → bytes
+
+   The ~#:encode~ / ~#:decode~ value functions are the right
+   mechanism. The question is whether the DSL can derive them
+   (partially or fully) from the wire structure and a type-mapping
+   declaration.
